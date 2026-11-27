@@ -10,7 +10,7 @@ final class NativeFilePicker: NSObject, UIDocumentPickerDelegate {
     static let shared = NativeFilePicker()
     private var completion: (([URL]) -> Void)?
 
-    static var allSupportedTypes: [UTType] {
+    nonisolated static var allSupportedTypes: [UTType] {
         var types: [UTType] = [.item, .data, .content, .archive, .zip, .pkcs12, .json]
         let customExts = ["ipa", "p12", "mobileprovision", "dylib", "deb", "json"]
         for ext in customExts {
