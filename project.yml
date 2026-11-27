@@ -2,7 +2,7 @@ name: MyFirstApp
 options:
   bundleIdPrefix: com.tenban
   deploymentTarget:
-    iOS: "16.0"
+    iOS: "18.0"
 targets:
   MyFirstApp:
     type: application
@@ -17,8 +17,8 @@ targets:
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait
-        MARKETING_VERSION: "1.0"
-        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "3.0"
+        CURRENT_PROJECT_VERSION: "30"
         CODE_SIGNING_ALLOWED: "NO"
         CODE_SIGNING_REQUIRED: "NO"
         CODE_SIGN_IDENTITY: ""
