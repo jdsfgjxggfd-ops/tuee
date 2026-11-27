@@ -1,6 +1,112 @@
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
+import Security
+import CryptoKit
+
+// MARK: - Native UIKit Document Picker (Fix triệt để lỗi đơ & xám file)
+@MainActor
+final class NativeFilePicker: NSObject, UIDocumentPickerDelegate {
+    static let shared = NativeFilePicker()
+    private var completion: (([URL]) -> Void)?
+
+    static var allSupportedTypes: [UTType] {
+        var types: [UTType] = [.item, .data, .content, .archive, .zip, .pkcs12, .json]
+        let customExts = ["ipa", "p12", "mobileprovision", "dylib", "deb", "json"]
+        for ext in customExts {
+            if let t = UTType(filenameExtension: ext) {
+                types.append(t)
+            }
+        }
+        return types
+    }
+
+    func pick(
+        types: [UTType] = NativeFilePicker.allSupportedTypes,
+        allowsMultiple: Bool = false,
+        completion: @escaping ([URL]) -> Void
+    ) {
+        guard let presenter = Self.topViewController() else {
+            completion([])
+            return
+        }
+        self.completion = completion
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: true)
+        picker.delegate = self
+        picker.allowsMultipleSelection = allowsMultiple
+        picker.shouldShowFileExtensions = true
+        presenter.present(picker, animated: true)
+    }
+
+    nonisolated func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+        Task { @MainActor in
+            let handler = self.completion
+            self.completion = nil
+            handler?(urls)
+        }
+    }
+
+    nonisolated func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+        Task { @MainActor in
+            self.completion = nil
+        }
+    }
+
+    private static func topViewController() -> UIViewController? {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let activeScene = scenes.first(where: { $0.activationState == .foregroundActive }) ?? scenes.first
+        let window = activeScene?.windows.first(where: { $0.isKeyWindow }) ?? activeScene?.windows.first
+        var top = window?.rootViewController
+        while let presented = top?.presentedViewController {
+            top = presented
+        }
+        return top
+    }
+}
+
+// MARK: - iOS 26/27 Adaptive Modifiers
+extension View {
+    @ViewBuilder
+    func applyLiquidTabBehavior() -> some View {
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) {
+            self.tabBarMinimizeBehavior(.onScrollDown)
+        } else {
+            self
+        }
+        #else
+        self
+        #endif
+    }
+}
+
+// MARK: - Appearance & Preferences
+enum AppAppearanceMode: String, CaseIterable, Identifiable {
+    case system = "Hệ thống"
+    case dark = "Tối"
+    case light = "Sáng"
+
+    var id: String { rawValue }
+
+    var colorScheme: ColorScheme? {
+        switch self {
+        case .system: return nil
+        case .dark: return .dark
+        case .light: return .light
+        }
+    }
+}
+
+enum CardStyleMode: String, CaseIterable, Identifiable {
+    case tinted = "Màu trầm (LiveContainer)"
+    case native = "Xám gốc Apple"
+
+    var id: String { rawValue }
+}
+
+enum MainTab: Hashable {
+    case apps, sources, library, settings, search
+}
 
 // MARK: - AltSource Models
 struct AltSource: Codable {
@@ -77,16 +183,15 @@ struct AltApp: Codable, Identifiable {
         return .tools
     }
 
-    // Màu nền thẻ nhẹ nhàng kiểu LiveContainer theo từng app
     var cardTint: Color {
         let hash = abs(name.hashValue)
         let palette: [Color] = [
-            Color(red: 0.24, green: 0.21, blue: 0.19), // Nâu xám ấm
-            Color(red: 0.08, green: 0.24, blue: 0.14), // Xanh lá đậm
-            Color(red: 0.30, green: 0.18, blue: 0.11), // Nâu cam đất
-            Color(red: 0.12, green: 0.28, blue: 0.18), // Xanh ngọc tối
-            Color(red: 0.21, green: 0.19, blue: 0.34), // Tím trầm
-            Color(red: 0.14, green: 0.20, blue: 0.28)  // Xanh dương trầm
+            Color(red: 0.24, green: 0.21, blue: 0.19),
+            Color(red: 0.08, green: 0.24, blue: 0.14),
+            Color(red: 0.30, green: 0.18, blue: 0.11),
+            Color(red: 0.12, green: 0.28, blue: 0.18),
+            Color(red: 0.21, green: 0.19, blue: 0.34),
+            Color(red: 0.14, green: 0.20, blue: 0.28)
         ]
         return palette[hash % palette.count]
     }
@@ -110,7 +215,33 @@ struct AltApp: Codable, Identifiable {
     }
 }
 
-// MARK: - Certificate & Library Models
+enum AppCategory: String, CaseIterable, Identifiable {
+    case all = "Tất cả"
+    case emu = "EMU"
+    case ports = "Ports"
+    case sideload = "Sideloading"
+    case games = "Games"
+    case tools = "Tools"
+
+    var id: String { rawValue }
+}
+
+enum AppSortOrder: String, CaseIterable, Identifiable {
+    case defaultOrder = "Mặc định"
+    case nameAZ = "Tên A → Z"
+    case sizeDesc = "Dung lượng lớn"
+
+    var id: String { rawValue }
+}
+
+// MARK: - Certificate, IPA & Tweak Models
+enum P12VerifyStatus: String, Codable {
+    case verified = "P12 hợp lệ"
+    case wrongPassword = "Sai mật khẩu P12"
+    case invalidFile = "File P12 lỗi"
+    case missing = "Chưa có P12"
+}
+
 struct CertificateRecord: Codable, Identifiable {
     let id: UUID
     var label: String
@@ -119,6 +250,8 @@ struct CertificateRecord: Codable, Identifiable {
     var password: String
     var teamName: String
     var teamID: String
+    var p12SubjectName: String?
+    var p12Status: P12VerifyStatus
     var expirationDate: Date?
     var isEnterprise: Bool
     var deviceCount: Int
@@ -136,13 +269,15 @@ struct CertificateRecord: Codable, Identifiable {
 
     var statusText: String {
         if p12FileName == nil || provisionFileName == nil { return "Thiếu file" }
+        if p12Status == .wrongPassword { return "Sai mật khẩu" }
+        if p12Status == .invalidFile { return "P12 lỗi" }
         if isExpired { return "Hết hạn" }
         if let days = daysRemaining { return "Còn \(days) ngày" }
         return "Hoạt động"
     }
 
     var isReady: Bool {
-        p12FileName != nil && provisionFileName != nil && !isExpired
+        p12FileName != nil && provisionFileName != nil && p12Status == .verified && !isExpired
     }
 }
 
@@ -160,6 +295,19 @@ struct LocalIPAItem: Codable, Identifiable {
     }
 }
 
+struct LocalTweakItem: Codable, Identifiable {
+    let id: UUID
+    var name: String
+    var fileName: String
+    var fileExtension: String
+    var sizeBytes: Int64
+    var addedAt: Date
+
+    var formattedSize: String {
+        ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file)
+    }
+}
+
 struct ActiveDownloadTask: Identifiable {
     let id: String
     let appName: String
@@ -168,20 +316,48 @@ struct ActiveDownloadTask: Identifiable {
     var progress: Double
     var writtenBytes: Int64
     var totalBytes: Int64
+
+    var formattedProgress: String {
+        let written = ByteCountFormatter.string(fromByteCount: writtenBytes, countStyle: .file)
+        if totalBytes > 0 {
+            let total = ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
+            return "\(written) / \(total)"
+        }
+        return written
+    }
 }
 
-enum AppCategory: String, CaseIterable, Identifiable {
-    case all = "Tất cả"
-    case emu = "EMU"
-    case ports = "Ports"
-    case sideload = "Sideloading"
-    case games = "Games"
-    case tools = "Tools"
+// MARK: - Cryptographic & Profile Parsers
+enum P12Verifier {
+    static func verify(fileURL: URL, password: String) -> (status: P12VerifyStatus, subject: String?) {
+        guard let data = try? Data(contentsOf: fileURL) else {
+            return (.invalidFile, nil)
+        }
+        let options: [String: Any] = [kSecImportExportPassphrase as String: password]
+        var rawItems: CFArray?
+        let status = SecPKCS12Import(data as CFData, options as CFDictionary, &rawItems)
+        if status == errSecAuthFailed {
+            return (.wrongPassword, nil)
+        }
+        guard status == errSecSuccess,
+              let items = rawItems as? [[String: Any]],
+              let first = items.first else {
+            return (.invalidFile, nil)
+        }
 
-    var id: String { rawValue }
+        var subject: String?
+        if let rawIdentity = first[kSecImportItemIdentity as String],
+           CFGetTypeID(rawIdentity as CFTypeRef) == SecIdentityGetTypeID() {
+            let identity = rawIdentity as! SecIdentity
+            var cert: SecCertificate?
+            if SecIdentityCopyCertificate(identity, &cert) == errSecSuccess, let cert = cert {
+                subject = SecCertificateCopySubjectSummary(cert) as String?
+            }
+        }
+        return (.verified, subject)
+    }
 }
 
-// MARK: - MobileProvision XML Parser
 enum MobileProvisionParser {
     struct ParsedInfo {
         var name: String
@@ -215,8 +391,25 @@ enum MobileProvisionParser {
     }
 }
 
-// MARK: - URLSession Download Delegate Bridge
-final class DownloadSessionBridge: NSObject, URLSessionDownloadDelegate {
+enum FileHasher {
+    static func sha256(url: URL) async -> String {
+        await Task.detached(priority: .utility) {
+            guard let handle = try? FileHandle(forReadingFrom: url) else { return "Không đọc được" }
+            defer { try? handle.close() }
+            var hasher = SHA256()
+            while true {
+                let chunk = (try? handle.read(upToCount: 1_048_576)) ?? Data()
+                if chunk.isEmpty { break }
+                hasher.update(data: chunk)
+            }
+            let digest = hasher.finalize()
+            return digest.map { String(format: "%02x", $0) }.joined()
+        }.value
+    }
+}
+
+// MARK: - Download Engine
+final class DownloadSessionBridge: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     var onProgress: ((String, Int64, Int64) -> Void)?
     var onFinished: ((String, URL) -> Void)?
     var onError: ((String, String) -> Void)?
@@ -257,35 +450,47 @@ final class DownloadSessionBridge: NSObject, URLSessionDownloadDelegate {
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         guard let error = error, let id = task.taskDescription else { return }
+        if (error as NSError).code == NSURLErrorCancelled { return }
         DispatchQueue.main.async { [weak self] in
             self?.onError?(id, error.localizedDescription)
         }
     }
 }
 
-// MARK: - Store Manager
+// MARK: - Central Store Manager
 @MainActor
 final class IPAStoreManager: ObservableObject {
     @Published var apps: [AltApp] = []
     @Published var sourceURLs: [String] = []
+    @Published var repoAppCounts: [String: Int] = [:]
     @Published var favoriteIDs: Set<String> = []
     @Published var certificates: [CertificateRecord] = []
     @Published var selectedCertID: UUID?
     @Published var localIPAs: [LocalIPAItem] = []
+    @Published var localTweaks: [LocalTweakItem] = []
     @Published var activeDownloads: [String: ActiveDownloadTask] = [:]
     @Published var isLoading = false
     @Published var alertMessage: String?
 
+    @Published var appearance: AppAppearanceMode = .dark {
+        didSet { UserDefaults.standard.set(appearance.rawValue, forKey: appearanceKey) }
+    }
+    @Published var cardStyle: CardStyleMode = .tinted {
+        didSet { UserDefaults.standard.set(cardStyle.rawValue, forKey: cardStyleKey) }
+    }
     @Published var hapticsEnabled: Bool = true {
         didSet { UserDefaults.standard.set(hapticsEnabled, forKey: hapticsKey) }
     }
 
-    private let sourcesKey = "TueeHub_v22_Sources"
-    private let favoritesKey = "TueeHub_v22_Favorites"
-    private let certsKey = "TueeHub_v22_Certs"
-    private let selectedCertKey = "TueeHub_v22_SelectedCert"
-    private let localIPAsKey = "TueeHub_v22_LocalIPAs"
-    private let hapticsKey = "TueeHub_v22_Haptics"
+    private let sourcesKey = "TueeHub_v3_Sources"
+    private let favoritesKey = "TueeHub_v3_Favorites"
+    private let certsKey = "TueeHub_v3_Certs"
+    private let selectedCertKey = "TueeHub_v3_SelectedCert"
+    private let localIPAsKey = "TueeHub_v3_LocalIPAs"
+    private let localTweaksKey = "TueeHub_v3_LocalTweaks"
+    private let appearanceKey = "TueeHub_v3_Appearance"
+    private let cardStyleKey = "TueeHub_v3_CardStyle"
+    private let hapticsKey = "TueeHub_v3_Haptics"
 
     private var downloadBridge: DownloadSessionBridge!
     private var downloadSession: URLSession!
@@ -307,11 +512,23 @@ final class IPAStoreManager: ObservableObject {
         return dir
     }
 
+    var tweaksDir: URL {
+        let dir = documentsDir.appendingPathComponent("Tweaks", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
     var activeCertificate: CertificateRecord? {
         if let id = selectedCertID, let found = certificates.first(where: { $0.id == id }) {
             return found
         }
         return certificates.first(where: { $0.isReady }) ?? certificates.first
+    }
+
+    var totalStorageBytes: Int64 {
+        let ipaSum = localIPAs.reduce(Int64(0)) { $0 + $1.sizeBytes }
+        let tweakSum = localTweaks.reduce(Int64(0)) { $0 + $1.sizeBytes }
+        return ipaSum + tweakSum
     }
 
     let curatedGitHubApps: [AltApp] = [
@@ -408,7 +625,10 @@ final class IPAStoreManager: ObservableObject {
     }
 
     private func loadSavedState() {
-        sourceURLs = UserDefaults.standard.stringArray(forKey: sourcesKey) ?? ["https://apps.altstore.io"]
+        sourceURLs = UserDefaults.standard.stringArray(forKey: sourcesKey)
+            ?? UserDefaults.standard.stringArray(forKey: "TueeHub_v22_Sources")
+            ?? ["https://apps.altstore.io"]
+
         if let savedFavs = UserDefaults.standard.stringArray(forKey: favoritesKey) {
             favoriteIDs = Set(savedFavs)
         }
@@ -422,6 +642,18 @@ final class IPAStoreManager: ObservableObject {
         if let data = UserDefaults.standard.data(forKey: localIPAsKey),
            let decoded = try? JSONDecoder().decode([LocalIPAItem].self, from: data) {
             localIPAs = decoded
+        }
+        if let data = UserDefaults.standard.data(forKey: localTweaksKey),
+           let decoded = try? JSONDecoder().decode([LocalTweakItem].self, from: data) {
+            localTweaks = decoded
+        }
+        if let raw = UserDefaults.standard.string(forKey: appearanceKey),
+           let parsed = AppAppearanceMode(rawValue: raw) {
+            appearance = parsed
+        }
+        if let raw = UserDefaults.standard.string(forKey: cardStyleKey),
+           let parsed = CardStyleMode(rawValue: raw) {
+            cardStyle = parsed
         }
         if UserDefaults.standard.object(forKey: hapticsKey) != nil {
             hapticsEnabled = UserDefaults.standard.bool(forKey: hapticsKey)
@@ -450,7 +682,7 @@ final class IPAStoreManager: ObservableObject {
                 appName: meta?.appName ?? destURL.deletingPathExtension().lastPathComponent,
                 fileName: destURL.lastPathComponent,
                 version: meta?.version ?? "1.0",
-                bundleID: meta?.bundleID ?? "com.tueehub.imported",
+                bundleID: meta?.bundleID ?? "com.tueehub.downloaded",
                 sizeBytes: size,
                 addedAt: Date()
             )
@@ -486,12 +718,38 @@ final class IPAStoreManager: ObservableObject {
 
     func addSource(_ rawURL: String) {
         let trimmed = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, URL(string: trimmed) != nil else { return }
+        guard !trimmed.isEmpty, URL(string: trimmed) != nil else {
+            alertMessage = "Đường dẫn JSON không hợp lệ."
+            return
+        }
         if !sourceURLs.contains(trimmed) {
             triggerHaptic(.medium)
             sourceURLs.append(trimmed)
             UserDefaults.standard.set(sourceURLs, forKey: sourcesKey)
             Task { await refreshAll() }
+        }
+    }
+
+    func importLocalJSONRepo(from url: URL) {
+        do {
+            let data = try Data(contentsOf: url)
+            let decoded = try JSONDecoder().decode(AltSource.self, from: data)
+            let repoName = decoded.name ?? url.deletingPathExtension().lastPathComponent
+            var added = 0
+            var existingKeys = Set(apps.map { "\($0.safeBundleID.lowercased())|\($0.name.lowercased())" })
+            for var item in decoded.apps ?? [] {
+                let key = "\(item.safeBundleID.lowercased())|\(item.name.lowercased())"
+                if !existingKeys.contains(key) {
+                    existingKeys.insert(key)
+                    item.sourceName = repoName
+                    apps.append(item)
+                    added += 1
+                }
+            }
+            triggerHaptic(.medium)
+            alertMessage = "Đã nạp \(added) ứng dụng từ file \(url.lastPathComponent)."
+        } catch {
+            alertMessage = "File JSON không đúng chuẩn AltSource: \(error.localizedDescription)"
         }
     }
 
@@ -505,6 +763,7 @@ final class IPAStoreManager: ObservableObject {
         isLoading = true
         var combined: [AltApp] = curatedGitHubApps
         var seen = Set(curatedGitHubApps.map { "\($0.safeBundleID.lowercased())|\($0.name.lowercased())" })
+        var counts: [String: Int] = [:]
 
         for urlString in sourceURLs {
             guard let url = URL(string: urlString) else { continue }
@@ -512,7 +771,9 @@ final class IPAStoreManager: ObservableObject {
                 let (data, _) = try await URLSession.shared.data(from: url)
                 let decoded = try JSONDecoder().decode(AltSource.self, from: data)
                 let repoName = decoded.name ?? (url.host ?? "Repo")
-                for var item in decoded.apps ?? [] {
+                let list = decoded.apps ?? []
+                counts[urlString] = list.count
+                for var item in list {
                     let key = "\(item.safeBundleID.lowercased())|\(item.name.lowercased())"
                     if !seen.contains(key) {
                         seen.insert(key)
@@ -521,32 +782,40 @@ final class IPAStoreManager: ObservableObject {
                     }
                 }
             } catch {
-                alertMessage = "Không đồng bộ được nguồn: \(url.host ?? urlString)"
+                counts[urlString] = 0
             }
         }
 
+        repoAppCounts = counts
         apps = combined
         isLoading = false
     }
 
+    // MARK: - Downloads & Direct URL
     func startIPADownload(for app: AltApp) {
         guard let url = URL(string: app.bestDownloadURL), !app.bestDownloadURL.isEmpty else { return }
-        if activeDownloads[app.id] != nil { return }
+        startDirectURLDownload(url: url, appName: app.name, version: app.bestVersion, bundleID: app.safeBundleID, expectedSize: app.rawSizeBytes, taskID: app.id)
+    }
+
+    func startDirectURLDownload(url: URL, appName: String? = nil, version: String = "Direct", bundleID: String = "com.tueehub.direct", expectedSize: Int64 = 0, taskID: String? = nil) {
+        let id = taskID ?? UUID().uuidString
+        if activeDownloads[id] != nil { return }
+        let name = appName ?? url.deletingPathExtension().lastPathComponent
 
         triggerHaptic(.medium)
-        activeDownloads[app.id] = ActiveDownloadTask(
-            id: app.id,
-            appName: app.name,
-            version: app.bestVersion,
-            bundleID: app.safeBundleID,
+        activeDownloads[id] = ActiveDownloadTask(
+            id: id,
+            appName: name.isEmpty ? "Downloaded App" : name,
+            version: version,
+            bundleID: bundleID,
             progress: 0.02,
             writtenBytes: 0,
-            totalBytes: app.rawSizeBytes
+            totalBytes: expectedSize
         )
 
         let task = downloadSession.downloadTask(with: url)
-        task.taskDescription = app.id
-        runningTasks[app.id] = task
+        task.taskDescription = id
+        runningTasks[id] = task
         task.resume()
     }
 
@@ -556,33 +825,75 @@ final class IPAStoreManager: ObservableObject {
         activeDownloads.removeValue(forKey: id)
     }
 
-    func importLocalIPA(from url: URL) {
-        let accessed = url.startAccessingSecurityScopedResource()
-        defer { if accessed { url.stopAccessingSecurityScopedResource() } }
-        guard url.pathExtension.lowercased() == "ipa" else {
-            alertMessage = "Vui lòng chọn đúng file đuôi .ipa"
-            return
+    // MARK: - Local IPA & Tweak Importers
+    func importLocalIPAs(from urls: [URL]) {
+        var successCount = 0
+        for url in urls {
+            let ext = url.pathExtension.lowercased()
+            guard ext == "ipa" || ext == "zip" else { continue }
+            let safeName = "\(UUID().uuidString.prefix(6))_\(url.lastPathComponent)"
+            let dest = ipasDir.appendingPathComponent(safeName)
+            do {
+                if FileManager.default.fileExists(atPath: dest.path) {
+                    try FileManager.default.removeItem(at: dest)
+                }
+                try FileManager.default.copyItem(at: url, to: dest)
+                let size = (try? FileManager.default.attributesOfItem(atPath: dest.path)[.size] as? Int64) ?? 0
+                let item = LocalIPAItem(
+                    id: UUID(),
+                    appName: url.deletingPathExtension().lastPathComponent,
+                    fileName: safeName,
+                    version: "Local",
+                    bundleID: "local.imported.ipa",
+                    sizeBytes: size,
+                    addedAt: Date()
+                )
+                localIPAs.insert(item, at: 0)
+                successCount += 1
+            } catch {
+                alertMessage = "Không nhập được \(url.lastPathComponent): \(error.localizedDescription)"
+            }
         }
-
-        let safeName = "\(UUID().uuidString.prefix(6))_\(url.lastPathComponent)"
-        let dest = ipasDir.appendingPathComponent(safeName)
-        do {
-            try FileManager.default.copyItem(at: url, to: dest)
-            let size = (try? FileManager.default.attributesOfItem(atPath: dest.path)[.size] as? Int64) ?? 0
-            let item = LocalIPAItem(
-                id: UUID(),
-                appName: url.deletingPathExtension().lastPathComponent,
-                fileName: safeName,
-                version: "Local",
-                bundleID: "local.imported.ipa",
-                sizeBytes: size,
-                addedAt: Date()
-            )
-            localIPAs.insert(item, at: 0)
+        if successCount > 0 {
             persistLocalIPAs()
             triggerHaptic(.medium)
-        } catch {
-            alertMessage = "Lỗi nhập IPA: \(error.localizedDescription)"
+        } else if !urls.isEmpty {
+            alertMessage = "Vui lòng chọn file có đuôi .ipa."
+        }
+    }
+
+    func importLocalTweaks(from urls: [URL]) {
+        var successCount = 0
+        for url in urls {
+            let ext = url.pathExtension.lowercased()
+            guard ext == "dylib" || ext == "deb" || ext == "framework" || ext == "zip" else { continue }
+            let safeName = "\(UUID().uuidString.prefix(6))_\(url.lastPathComponent)"
+            let dest = tweaksDir.appendingPathComponent(safeName)
+            do {
+                if FileManager.default.fileExists(atPath: dest.path) {
+                    try FileManager.default.removeItem(at: dest)
+                }
+                try FileManager.default.copyItem(at: url, to: dest)
+                let size = (try? FileManager.default.attributesOfItem(atPath: dest.path)[.size] as? Int64) ?? 0
+                let item = LocalTweakItem(
+                    id: UUID(),
+                    name: url.deletingPathExtension().lastPathComponent,
+                    fileName: safeName,
+                    fileExtension: ext.uppercased(),
+                    sizeBytes: size,
+                    addedAt: Date()
+                )
+                localTweaks.insert(item, at: 0)
+                successCount += 1
+            } catch {
+                alertMessage = "Không nhập được tweak: \(error.localizedDescription)"
+            }
+        }
+        if successCount > 0 {
+            persistLocalTweaks()
+            triggerHaptic(.medium)
+        } else if !urls.isEmpty {
+            alertMessage = "Vui lòng chọn file đuôi .dylib hoặc .deb."
         }
     }
 
@@ -590,13 +901,24 @@ final class IPAStoreManager: ObservableObject {
         ipasDir.appendingPathComponent(item.fileName)
     }
 
+    func urlForTweak(_ item: LocalTweakItem) -> URL {
+        tweaksDir.appendingPathComponent(item.fileName)
+    }
+
     func deleteLocalIPA(at offsets: IndexSet) {
         for idx in offsets {
-            let item = localIPAs[idx]
-            try? FileManager.default.removeItem(at: urlForLocalIPA(item))
+            try? FileManager.default.removeItem(at: urlForLocalIPA(localIPAs[idx]))
         }
         localIPAs.remove(atOffsets: offsets)
         persistLocalIPAs()
+    }
+
+    func deleteLocalTweak(at offsets: IndexSet) {
+        for idx in offsets {
+            try? FileManager.default.removeItem(at: urlForTweak(localTweaks[idx]))
+        }
+        localTweaks.remove(atOffsets: offsets)
+        persistLocalTweaks()
     }
 
     private func persistLocalIPAs() {
@@ -605,29 +927,37 @@ final class IPAStoreManager: ObservableObject {
         }
     }
 
+    private func persistLocalTweaks() {
+        if let encoded = try? JSONEncoder().encode(localTweaks) {
+            UserDefaults.standard.set(encoded, forKey: localTweaksKey)
+        }
+    }
+
+    // MARK: - Certificate Vault
     func saveNewCertificate(label: String, p12SourceURL: URL?, provisionSourceURL: URL?, password: String) {
         var savedP12Name: String?
         var savedProvName: String?
         var teamName = "Chưa xác định"
         var teamID = "N/A"
+        var p12Subject: String?
+        var p12Status: P12VerifyStatus = .missing
         var expDate: Date?
         var isEnterprise = false
         var deviceCount = 0
         var finalLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if let p12URL = p12SourceURL {
-            let accessed = p12URL.startAccessingSecurityScopedResource()
-            defer { if accessed { p12URL.stopAccessingSecurityScopedResource() } }
             let destName = "cert_\(UUID().uuidString.prefix(8)).p12"
             let dest = certsDir.appendingPathComponent(destName)
             if (try? FileManager.default.copyItem(at: p12URL, to: dest)) != nil {
                 savedP12Name = destName
+                let verified = P12Verifier.verify(fileURL: dest, password: password)
+                p12Status = verified.status
+                p12Subject = verified.subject
             }
         }
 
         if let provURL = provisionSourceURL {
-            let accessed = provURL.startAccessingSecurityScopedResource()
-            defer { if accessed { provURL.stopAccessingSecurityScopedResource() } }
             let destName = "prov_\(UUID().uuidString.prefix(8)).mobileprovision"
             let dest = certsDir.appendingPathComponent(destName)
             if (try? FileManager.default.copyItem(at: provURL, to: dest)) != nil {
@@ -643,7 +973,9 @@ final class IPAStoreManager: ObservableObject {
             }
         }
 
-        if finalLabel.isEmpty { finalLabel = "Chứng chỉ #\(certificates.count + 1)" }
+        if finalLabel.isEmpty {
+            finalLabel = p12Subject ?? "Chứng chỉ #\(certificates.count + 1)"
+        }
 
         let record = CertificateRecord(
             id: UUID(),
@@ -653,6 +985,8 @@ final class IPAStoreManager: ObservableObject {
             password: password,
             teamName: teamName,
             teamID: teamID,
+            p12SubjectName: p12Subject,
+            p12Status: p12Status,
             expirationDate: expDate,
             isEnterprise: isEnterprise,
             deviceCount: deviceCount,
@@ -663,6 +997,10 @@ final class IPAStoreManager: ObservableObject {
         selectedCertID = record.id
         persistCertificates()
         triggerHaptic(.medium)
+
+        if p12Status == .wrongPassword {
+            alertMessage = "Đã lưu chứng chỉ nhưng mật khẩu file .p12 không đúng. Bạn hãy kiểm tra lại mật khẩu."
+        }
     }
 
     func selectCertificate(_ cert: CertificateRecord) {
@@ -684,6 +1022,15 @@ final class IPAStoreManager: ObservableObject {
         persistCertificates()
     }
 
+    func clearTempCache() {
+        let tmp = FileManager.default.temporaryDirectory
+        if let files = try? FileManager.default.contentsOfDirectory(at: tmp, includingPropertiesForKeys: nil) {
+            for f in files { try? FileManager.default.removeItem(at: f) }
+        }
+        triggerHaptic(.medium)
+        alertMessage = "Đã dọn sạch bộ nhớ đệm tạm thời."
+    }
+
     private func persistCertificates() {
         if let encoded = try? JSONEncoder().encode(certificates) {
             UserDefaults.standard.set(encoded, forKey: certsKey)
@@ -696,40 +1043,38 @@ final class IPAStoreManager: ObservableObject {
     }
 }
 
-// MARK: - Root ContentView (100% Native iOS TabView)
+// MARK: - Root ContentView (iOS 27 Native Liquid Glass TabView)
 struct ContentView: View {
     @StateObject private var store = IPAStoreManager()
+    @State private var selectedTab: MainTab = .apps
+    @State private var globalSearchText = ""
 
     var body: some View {
-        TabView {
-            AppsTabView(store: store)
-                .tabItem {
-                    Label("Apps", systemImage: "square.stack.3d.up.fill")
-                }
+        TabView(selection: $selectedTab) {
+            Tab("Apps", systemImage: "square.stack.3d.up.fill", value: MainTab.apps) {
+                AppsTabView(store: store)
+            }
 
-            ReposTabView(store: store)
-                .tabItem {
-                    Label("Sources", systemImage: "books.vertical.fill")
-                }
+            Tab("Sources", systemImage: "books.vertical.fill", value: MainTab.sources) {
+                SourcesTabView(store: store)
+            }
 
-            CertsTabView(store: store)
-                .tabItem {
-                    Label("Certs", systemImage: "checkmark.seal.fill")
-                }
+            Tab("Library", systemImage: "tray.full.fill", value: MainTab.library) {
+                LibraryTabView(store: store)
+            }
+            .badge(store.activeDownloads.count)
 
-            LibraryTabView(store: store)
-                .tabItem {
-                    Label("Library", systemImage: "arrow.down.circle.fill")
-                }
-                .badge(store.activeDownloads.count)
+            Tab("Settings", systemImage: "gearshape.fill", value: MainTab.settings) {
+                SettingsTabView(store: store)
+            }
 
-            SettingsTabView(store: store)
-                .tabItem {
-                    Label("Settings", systemImage: "gearshape.fill")
-                }
+            Tab(value: MainTab.search, role: .search) {
+                GlobalSearchView(store: store, query: $globalSearchText)
+            }
         }
-        .preferredColorScheme(.dark)
-        .alert("Thông báo", isPresented: Binding(
+        .applyLiquidTabBehavior()
+        .preferredColorScheme(store.appearance.colorScheme)
+        .alert("TueeHub", isPresented: Binding(
             get: { store.alertMessage != nil },
             set: { if !$0 { store.alertMessage = nil } }
         )) {
@@ -740,24 +1085,26 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Tab 1: Apps (Phong cách LiveContainer / iOS gốc)
+// MARK: - Tab 1: My Apps
 struct AppsTabView: View {
     @ObservedObject var store: IPAStoreManager
-    @State private var searchText = ""
     @State private var selectedCategory: AppCategory = .all
+    @State private var sortOrder: AppSortOrder = .defaultOrder
     @State private var favoritesOnly = false
     @State private var selectedApp: AltApp?
+    @State private var showCertSheet = false
     @Environment(\.openURL) private var openURL
 
     var filteredApps: [AltApp] {
-        store.apps.filter { app in
+        let list = store.apps.filter { app in
             let matchesFav = !favoritesOnly || store.isFavorite(app)
             let matchesCat = selectedCategory == .all || app.resolvedCategory == selectedCategory
-            let matchesSearch = searchText.isEmpty ||
-                app.name.localizedCaseInsensitiveContains(searchText) ||
-                (app.subtitle?.localizedCaseInsensitiveContains(searchText) ?? false) ||
-                app.safeBundleID.localizedCaseInsensitiveContains(searchText)
-            return matchesFav && matchesCat && matchesSearch
+            return matchesFav && matchesCat
+        }
+        switch sortOrder {
+        case .defaultOrder: return list
+        case .nameAZ: return list.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        case .sizeDesc: return list.sorted { $0.rawSizeBytes > $1.rawSizeBytes }
         }
     }
 
@@ -765,14 +1112,14 @@ struct AppsTabView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    // Dải lọc danh mục tối giản chuẩn iOS
+                    // Bộ lọc danh mục tối giản chuẩn iOS 27
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 8) {
                             ForEach(AppCategory.allCases) { cat in
                                 let isSelected = selectedCategory == cat
                                 Button {
                                     store.triggerHaptic(.light)
-                                    selectedCategory = cat
+                                    withAnimation(.snappy) { selectedCategory = cat }
                                 } label: {
                                     Text(cat.rawValue)
                                         .font(.subheadline.weight(.semibold))
@@ -788,11 +1135,12 @@ struct AppsTabView: View {
                         .padding(.horizontal, 16)
                     }
 
-                    // Danh sách thẻ App kiểu LiveContainer
+                    // Thẻ danh sách ứng dụng kiểu LiveContainer
                     LazyVStack(spacing: 12) {
                         ForEach(filteredApps) { app in
                             NativeAppCard(
                                 app: app,
+                                cardStyle: store.cardStyle,
                                 isFavorite: store.isFavorite(app),
                                 downloadTask: store.activeDownloads[app.id],
                                 onSelect: { selectedApp = app },
@@ -809,39 +1157,72 @@ struct AppsTabView: View {
                         }
                     }
                     .padding(.horizontal, 16)
-                    .padding(.bottom, 16)
 
                     Text("\(filteredApps.count) apps total")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity)
-                        .padding(.bottom, 12)
+                        .padding(.vertical, 10)
                 }
                 .padding(.top, 4)
             }
-            .background(Color.black.ignoresSafeArea())
+            .background(Color(uiColor: .systemBackground).ignoresSafeArea())
             .navigationTitle("My Apps")
-            .searchable(text: $searchText, prompt: "Tìm ứng dụng, bundle ID...")
             .refreshable { await store.refreshAll() }
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
+                ToolbarItemGroup(placement: .topBarLeading) {
                     Button {
-                        Task { await store.refreshAll() }
+                        NativeFilePicker.shared.pick(allowsMultiple: true) { urls in
+                            store.importLocalIPAs(from: urls)
+                        }
                     } label: {
-                        Image(systemName: "arrow.clockwise")
+                        Image(systemName: "plus")
+                    }
+
+                    Button {
+                        showCertSheet = true
+                    } label: {
+                        Image(systemName: store.activeCertificate?.isReady == true ? "checkmark.seal.fill" : "checkmark.seal")
+                            .foregroundStyle(store.activeCertificate?.isReady == true ? .green : .primary)
                     }
                 }
-                ToolbarItem(placement: .topBarTrailing) {
+
+                ToolbarItemGroup(placement: .topBarTrailing) {
                     Button {
                         favoritesOnly.toggle()
                     } label: {
                         Image(systemName: favoritesOnly ? "heart.fill" : "heart")
                             .foregroundStyle(favoritesOnly ? .pink : .primary)
                     }
+
+                    Menu {
+                        Picker("Sắp xếp", selection: $sortOrder) {
+                            ForEach(AppSortOrder.allCases) { order in
+                                Text(order.rawValue).tag(order)
+                            }
+                        }
+                        Button {
+                            Task { await store.refreshAll() }
+                        } label: {
+                            Label("Làm mới nguồn", systemImage: "arrow.clockwise")
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
                 }
             }
             .sheet(item: $selectedApp) { app in
                 AppDetailSheet(app: app, store: store)
+            }
+            .sheet(isPresented: $showCertSheet) {
+                NavigationStack {
+                    CertVaultView(store: store)
+                        .toolbar {
+                            ToolbarItem(placement: .topBarLeading) {
+                                Button("Đóng") { showCertSheet = false }
+                            }
+                        }
+                }
             }
         }
     }
@@ -849,6 +1230,7 @@ struct AppsTabView: View {
 
 struct NativeAppCard: View {
     let app: AltApp
+    let cardStyle: CardStyleMode
     let isFavorite: Bool
     let downloadTask: ActiveDownloadTask?
     let onSelect: () -> Void
@@ -861,10 +1243,10 @@ struct NativeAppCard: View {
                     img.resizable().scaledToFill()
                 } else {
                     ZStack {
-                        Color.white.opacity(0.12)
+                        Color.secondary.opacity(0.2)
                         Image(systemName: "app.fill")
                             .font(.title2)
-                            .foregroundStyle(.white.opacity(0.75))
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
@@ -875,7 +1257,7 @@ struct NativeAppCard: View {
                 HStack(spacing: 5) {
                     Text(app.name)
                         .font(.headline)
-                        .foregroundStyle(.white)
+                        .foregroundStyle(cardStyle == .tinted ? .white : .primary)
                         .lineLimit(1)
                     if isFavorite {
                         Image(systemName: "heart.fill")
@@ -886,12 +1268,12 @@ struct NativeAppCard: View {
 
                 Text("\(app.bestVersion) - \(app.safeBundleID)")
                     .font(.subheadline)
-                    .foregroundStyle(.white.opacity(0.72))
+                    .foregroundStyle(cardStyle == .tinted ? .white.opacity(0.75) : .secondary)
                     .lineLimit(1)
 
                 Text(app.subtitle ?? app.sourceName ?? "GitHub Official")
                     .font(.caption2.monospaced())
-                    .foregroundStyle(.white.opacity(0.5))
+                    .foregroundStyle(cardStyle == .tinted ? .white.opacity(0.55) : .secondary)
                     .lineLimit(1)
             }
 
@@ -900,30 +1282,30 @@ struct NativeAppCard: View {
             if let dl = downloadTask {
                 ProgressView(value: dl.progress)
                     .progressViewStyle(.circular)
-                    .tint(.white)
-                    .frame(width: 64)
+                    .tint(cardStyle == .tinted ? .white : .accentColor)
+                    .frame(width: 68)
             } else {
                 Button(action: onAction) {
                     Text(app.isDirectIPA ? "Get" : "Open")
                         .font(.subheadline.bold())
                         .foregroundStyle(.white)
                         .frame(width: 72, height: 34)
-                        .background(app.buttonTint)
+                        .background(cardStyle == .tinted ? app.buttonTint : Color.accentColor)
                         .clipShape(Capsule())
                 }
                 .buttonStyle(.plain)
             }
         }
         .padding(14)
-        .background(app.cardTint)
+        .background(cardStyle == .tinted ? app.cardTint : Color(uiColor: .secondarySystemGroupedBackground))
         .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
         .contentShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
         .onTapGesture(perform: onSelect)
     }
 }
 
-// MARK: - Tab 2: Sources (Native InsetGrouped List)
-struct ReposTabView: View {
+// MARK: - Tab 2: Sources
+struct SourcesTabView: View {
     @ObservedObject var store: IPAStoreManager
     @State private var showAddAlert = false
     @State private var newRepoURL = ""
@@ -931,21 +1313,39 @@ struct ReposTabView: View {
     var body: some View {
         NavigationStack {
             List {
-                Section("Nguồn AltSource JSON") {
+                Section("Nguồn AltSource JSON (\(store.sourceURLs.count))") {
                     ForEach(store.sourceURLs, id: \.self) { url in
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(URL(string: url)?.host ?? "JSON Repo")
-                                .font(.headline)
-                            Text(url)
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
+                        HStack {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(URL(string: url)?.host ?? "JSON Repo")
+                                    .font(.headline)
+                                Text(url)
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                            Spacer()
+                            if let count = store.repoAppCounts[url] {
+                                Text("\(count)")
+                                    .font(.caption.bold())
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 3)
+                                    .background(Color.secondary.opacity(0.2))
+                                    .clipShape(Capsule())
+                            }
+                        }
+                        .contextMenu {
+                            Button {
+                                UIPasteboard.general.string = url
+                            } label: {
+                                Label("Copy đường dẫn", systemImage: "doc.on.doc")
+                            }
                         }
                     }
                     .onDelete(perform: store.removeSource)
                 }
 
-                Section("Thêm nhanh nguồn phổ biến") {
+                Section("Thêm nhanh nguồn cộng đồng") {
                     Button("AltStore Official") {
                         store.addSource("https://apps.altstore.io")
                     }
@@ -955,8 +1355,19 @@ struct ReposTabView: View {
                 }
             }
             .navigationTitle("Sources")
+            .refreshable { await store.refreshAll() }
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button {
+                        NativeFilePicker.shared.pick(types: [.json, .data, .item]) { urls in
+                            if let first = urls.first {
+                                store.importLocalJSONRepo(from: first)
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "doc.badge.plus")
+                    }
+
                     Button {
                         showAddAlert = true
                     } label: {
@@ -980,85 +1391,373 @@ struct ReposTabView: View {
     }
 }
 
-// MARK: - Tab 3: Cert Vault (Native List)
-struct CertsTabView: View {
+// MARK: - Tab 3: Library (IPAs + Tweaks + Direct Link)
+struct LibraryTabView: View {
     @ObservedObject var store: IPAStoreManager
-    @State private var showImportSheet = false
+    @State private var segment = 0
+    @State private var inspectingItem: LocalIPAItem?
+    @State private var showDirectURLAlert = false
+    @State private var directURLText = ""
 
     var body: some View {
         NavigationStack {
             List {
-                if store.certificates.isEmpty {
-                    Section {
-                        VStack(spacing: 8) {
-                            Image(systemName: "checkmark.seal")
-                                .font(.largeTitle)
-                                .foregroundStyle(.secondary)
-                            Text("Chưa có chứng chỉ")
-                                .font(.headline)
-                            Text("Bấm dấu + ở góc trên để nhập file .p12 và .mobileprovision.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .multilineTextAlignment(.center)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 24)
+                Section {
+                    Picker("Mục", selection: $segment) {
+                        Text("IPAs (\(store.localIPAs.count))").tag(0)
+                        Text("Tweaks (\(store.localTweaks.count))").tag(1)
                     }
-                } else {
-                    Section("Chứng chỉ đã lưu") {
-                        ForEach(store.certificates) { cert in
-                            Button {
-                                store.selectCertificate(cert)
-                            } label: {
+                    .pickerStyle(.segmented)
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets())
+                }
+
+                if !store.activeDownloads.isEmpty {
+                    Section("Đang tải xuống") {
+                        ForEach(Array(store.activeDownloads.values)) { task in
+                            VStack(alignment: .leading, spacing: 6) {
                                 HStack {
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        HStack(spacing: 6) {
-                                            Text(cert.label)
+                                    Text(task.appName).font(.headline)
+                                    Spacer()
+                                    Text("\(Int(task.progress * 100))%")
+                                        .font(.caption.monospaced())
+                                        .foregroundStyle(.secondary)
+                                    Button("Hủy", role: .destructive) {
+                                        store.cancelDownload(id: task.id)
+                                    }
+                                    .font(.caption)
+                                }
+                                ProgressView(value: task.progress)
+                                Text(task.formattedProgress)
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    }
+                }
+
+                if segment == 0 {
+                    Section("Kho file IPA trên máy") {
+                        if store.localIPAs.isEmpty {
+                            ContentUnavailableView(
+                                "Chưa có file IPA",
+                                systemImage: "shippingbox",
+                                description: Text("Bấm nút + để nhập file .ipa từ app Tệp hoặc dán link tải trực tiếp.")
+                            )
+                        } else {
+                            ForEach(store.localIPAs) { item in
+                                Button {
+                                    inspectingItem = item
+                                } label: {
+                                    HStack(spacing: 12) {
+                                        Image(systemName: "shippingbox.fill")
+                                            .font(.title2)
+                                            .foregroundStyle(.blue)
+                                            .frame(width: 40, height: 40)
+                                            .background(Color.blue.opacity(0.14))
+                                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                                        VStack(alignment: .leading, spacing: 3) {
+                                            Text(item.appName)
                                                 .font(.headline)
                                                 .foregroundStyle(.primary)
-                                            Text(cert.statusText)
-                                                .font(.caption2.bold())
-                                                .padding(.horizontal, 7)
-                                                .padding(.vertical, 2)
-                                                .background(cert.isReady ? Color.green.opacity(0.2) : Color.orange.opacity(0.2))
-                                                .foregroundStyle(cert.isReady ? .green : .orange)
-                                                .clipShape(Capsule())
-                                        }
-                                        Text("\(cert.teamName) • \(cert.teamID)")
-                                            .font(.caption.monospaced())
-                                            .foregroundStyle(.secondary)
-                                        if let exp = cert.expirationDate {
-                                            Text("Hết hạn: \(exp.formatted(date: .abbreviated, time: .omitted))")
-                                                .font(.caption2)
+                                                .lineLimit(1)
+                                            Text("\(item.version) • \(item.formattedSize)")
+                                                .font(.caption.monospaced())
                                                 .foregroundStyle(.secondary)
                                         }
-                                    }
-                                    Spacer()
-                                    if store.activeCertificate?.id == cert.id {
-                                        Image(systemName: "checkmark")
-                                            .foregroundStyle(.blue)
-                                            .fontWeight(.semibold)
+
+                                        Spacer()
+
+                                        Text("Mở / Ký")
+                                            .font(.caption.bold())
+                                            .padding(.horizontal, 10)
+                                            .padding(.vertical, 5)
+                                            .background(Color.accentColor.opacity(0.16))
+                                            .foregroundStyle(Color.accentColor)
+                                            .clipShape(Capsule())
                                     }
                                 }
                             }
+                            .onDelete(perform: store.deleteLocalIPA)
                         }
-                        .onDelete(perform: store.deleteCertificate)
+                    }
+                } else {
+                    Section("Kho Tweaks (.dylib / .deb)") {
+                        if store.localTweaks.isEmpty {
+                            ContentUnavailableView(
+                                "Chưa có Tweak",
+                                systemImage: "wrench.and.screwdriver",
+                                description: Text("Bấm nút + để nhập tệp .dylib hoặc .deb từ app Tệp.")
+                            )
+                        } else {
+                            ForEach(store.localTweaks) { tweak in
+                                HStack(spacing: 12) {
+                                    Image(systemName: "puzzlepiece.extension.fill")
+                                        .font(.title3)
+                                        .foregroundStyle(.purple)
+                                        .frame(width: 38, height: 38)
+                                        .background(Color.purple.opacity(0.15))
+                                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(tweak.name)
+                                            .font(.headline)
+                                            .lineLimit(1)
+                                        Text("\(tweak.fileExtension) • \(tweak.formattedSize)")
+                                            .font(.caption.monospaced())
+                                            .foregroundStyle(.secondary)
+                                    }
+
+                                    Spacer()
+
+                                    ShareLink(item: store.urlForTweak(tweak)) {
+                                        Image(systemName: "square.and.arrow.up")
+                                    }
+                                }
+                            }
+                            .onDelete(perform: store.deleteLocalTweak)
+                        }
                     }
                 }
             }
-            .navigationTitle("Certificates")
+            .navigationTitle("Library")
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    if segment == 0 {
+                        Button {
+                            showDirectURLAlert = true
+                        } label: {
+                            Image(systemName: "link.badge.plus")
+                        }
+                    }
+
                     Button {
-                        showImportSheet = true
+                        NativeFilePicker.shared.pick(allowsMultiple: true) { urls in
+                            if segment == 0 {
+                                store.importLocalIPAs(from: urls)
+                            } else {
+                                store.importLocalTweaks(from: urls)
+                            }
+                        }
                     } label: {
                         Image(systemName: "plus")
                     }
                 }
             }
-            .sheet(isPresented: $showImportSheet) {
-                ImportCertificateSheet(store: store)
+            .alert("Tải IPA từ đường dẫn", isPresented: $showDirectURLAlert) {
+                TextField("https://.../app.ipa", text: $directURLText)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                Button("Tải về") {
+                    if let url = URL(string: directURLText.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                        store.startDirectURLDownload(url: url)
+                    } else {
+                        store.alertMessage = "Đường dẫn tải IPA không hợp lệ."
+                    }
+                    directURLText = ""
+                }
+                Button("Hủy", role: .cancel) { directURLText = "" }
+            } message: {
+                Text("Nhập link tải trực tiếp đuôi .ipa để lưu thẳng vào Library.")
             }
+            .sheet(item: $inspectingItem) { item in
+                IPAInspectorSheet(item: item, store: store)
+            }
+        }
+    }
+}
+
+struct IPAInspectorSheet: View {
+    let item: LocalIPAItem
+    @ObservedObject var store: IPAStoreManager
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var customName = ""
+    @State private var customBundleID = ""
+    @State private var enableFileSharing = true
+    @State private var removeDeviceLimit = true
+    @State private var selectedTweakIDs: Set<UUID> = []
+    @State private var sha256Hash = "Đang tính..."
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Chứng chỉ ký mặc định") {
+                    if let cert = store.activeCertificate {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(cert.label).font(.headline)
+                                Text("\(cert.teamName) • \(cert.statusText)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Image(systemName: cert.isReady ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                                .foregroundStyle(cert.isReady ? .green : .orange)
+                        }
+                    } else {
+                        Text("Chưa nhập chứng chỉ trong Cert Vault")
+                            .foregroundStyle(.orange)
+                    }
+                }
+
+                Section("Tùy chỉnh cấu hình IPA") {
+                    TextField("Tên hiển thị", text: $customName)
+                    TextField("Bundle ID", text: $customBundleID)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    Toggle("Bật Chia sẻ tệp (UIFileSharingEnabled)", isOn: $enableFileSharing)
+                    Toggle("Gỡ giới hạn thiết bị", isOn: $removeDeviceLimit)
+                }
+
+                if !store.localTweaks.isEmpty {
+                    Section("Gắn kèm Tweaks (.dylib / .deb)") {
+                        ForEach(store.localTweaks) { tweak in
+                            Button {
+                                if selectedTweakIDs.contains(tweak.id) {
+                                    selectedTweakIDs.remove(tweak.id)
+                                } else {
+                                    selectedTweakIDs.insert(tweak.id)
+                                }
+                            } label: {
+                                HStack {
+                                    Text(tweak.name).foregroundStyle(.primary)
+                                    Spacer()
+                                    if selectedTweakIDs.contains(tweak.id) {
+                                        Image(systemName: "checkmark").foregroundStyle(.blue)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Section("Thông tin tệp") {
+                    LabeledContent("Dung lượng", value: item.formattedSize)
+                    LabeledContent("Ngày thêm", value: item.addedAt.formatted(date: .abbreviated, time: .shortened))
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("SHA-256").font(.caption).foregroundStyle(.secondary)
+                        Text(sha256Hash)
+                            .font(.caption2.monospaced())
+                            .textSelection(.enabled)
+                    }
+                }
+
+                Section {
+                    ShareLink(item: store.urlForLocalIPA(item)) {
+                        Label("Gửi sang Feather / LiveContainer / SideStore", systemImage: "square.and.arrow.up")
+                            .frame(maxWidth: .infinity, alignment: .center)
+                    }
+                } footer: {
+                    Text("Chọn Feather, LiveContainer hoặc SideStore từ bảng chia sẻ gốc của iOS để ký và cài đặt ngay.")
+                }
+            }
+            .navigationTitle(item.appName)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Xong") { dismiss() }
+                }
+            }
+            .task {
+                customName = item.appName
+                customBundleID = item.bundleID
+                sha256Hash = await FileHasher.sha256(url: store.urlForLocalIPA(item))
+            }
+        }
+    }
+}
+
+// MARK: - Certificate Vault View & Importer (Fix triệt để chọn file)
+struct CertVaultView: View {
+    @ObservedObject var store: IPAStoreManager
+    @State private var showImportSheet = false
+
+    var body: some View {
+        List {
+            if store.certificates.isEmpty {
+                Section {
+                    ContentUnavailableView(
+                        "Chưa có chứng chỉ",
+                        systemImage: "checkmark.seal",
+                        description: Text("Bấm nút + góc trên để nhập file .p12 và .mobileprovision từ app Tệp.")
+                    )
+                }
+            } else {
+                Section("Chứng chỉ đã lưu (\(store.certificates.count))") {
+                    ForEach(store.certificates) { cert in
+                        Button {
+                            store.selectCertificate(cert)
+                        } label: {
+                            HStack(alignment: .top) {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack(spacing: 6) {
+                                        Text(cert.label)
+                                            .font(.headline)
+                                            .foregroundStyle(.primary)
+                                        Text(cert.statusText)
+                                            .font(.caption2.bold())
+                                            .padding(.horizontal, 7)
+                                            .padding(.vertical, 2)
+                                            .background(cert.isReady ? Color.green.opacity(0.2) : Color.orange.opacity(0.2))
+                                            .foregroundStyle(cert.isReady ? .green : .orange)
+                                            .clipShape(Capsule())
+                                    }
+
+                                    Text("\(cert.teamName) • \(cert.teamID)")
+                                        .font(.caption.monospaced())
+                                        .foregroundStyle(.secondary)
+
+                                    HStack(spacing: 8) {
+                                        Text(cert.p12Status.rawValue)
+                                            .font(.caption2.bold())
+                                            .foregroundStyle(cert.p12Status == .verified ? .green : .orange)
+                                        if cert.isEnterprise {
+                                            Text("Enterprise")
+                                                .font(.caption2.bold())
+                                                .foregroundStyle(.purple)
+                                        } else if cert.deviceCount > 0 {
+                                            Text("Ad-Hoc (\(cert.deviceCount) UDID)")
+                                                .font(.caption2)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+
+                                    if let exp = cert.expirationDate {
+                                        Text("Hết hạn: \(exp.formatted(date: .abbreviated, time: .omitted))")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+
+                                Spacer()
+
+                                if store.activeCertificate?.id == cert.id {
+                                    Image(systemName: "checkmark")
+                                        .foregroundStyle(.blue)
+                                        .fontWeight(.semibold)
+                                }
+                            }
+                        }
+                    }
+                    .onDelete(perform: store.deleteCertificate)
+                }
+            }
+        }
+        .navigationTitle("Cert Vault")
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    showImportSheet = true
+                } label: {
+                    Image(systemName: "plus")
+                }
+            }
+        }
+        .sheet(isPresented: $showImportSheet) {
+            ImportCertificateSheet(store: store)
         }
     }
 }
@@ -1067,49 +1766,61 @@ struct ImportCertificateSheet: View {
     @ObservedObject var store: IPAStoreManager
     @Environment(\.dismiss) private var dismiss
 
-    enum PickerTarget { case p12, provision }
-
     @State private var label = ""
     @State private var password = ""
     @State private var p12URL: URL?
     @State private var provisionURL: URL?
-    @State private var pickerTarget: PickerTarget = .p12
-    @State private var showFilePicker = false
+    @State private var p12CheckText: String?
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("Thông tin") {
-                    TextField("Tên gợi nhớ (tùy chọn)", text: $label)
-                    SecureField("Mật khẩu file .p12", text: $password)
-                }
-
-                Section("Tệp chứng chỉ") {
+                Section("1. Chọn tệp chứng chỉ") {
                     Button {
-                        pickerTarget = .p12
-                        showFilePicker = true
+                        NativeFilePicker.shared.pick { urls in
+                            if let url = urls.first {
+                                p12URL = url
+                                updateP12Check()
+                            }
+                        }
                     } label: {
                         HStack {
                             Label("Chọn file .p12", systemImage: "key.fill")
                             Spacer()
-                            Text(p12URL?.lastPathComponent ?? "Chưa chọn")
-                                .foregroundStyle(.secondary)
+                            Text(p12URL?.lastPathComponent ?? "Bấm để chọn")
+                                .foregroundStyle(p12URL == nil ? .secondary : .blue)
                                 .lineLimit(1)
                         }
                     }
 
                     Button {
-                        pickerTarget = .provision
-                        showFilePicker = true
+                        NativeFilePicker.shared.pick { urls in
+                            if let url = urls.first {
+                                provisionURL = url
+                            }
+                        }
                     } label: {
                         HStack {
                             Label("Chọn .mobileprovision", systemImage: "doc.badge.gearshape")
                             Spacer()
-                            Text(provisionURL?.lastPathComponent ?? "Chưa chọn")
-                                .foregroundStyle(.secondary)
+                            Text(provisionURL?.lastPathComponent ?? "Bấm để chọn")
+                                .foregroundStyle(provisionURL == nil ? .secondary : .blue)
                                 .lineLimit(1)
                         }
                     }
+                }
+
+                Section("2. Mật khẩu & Tên gợi nhớ") {
+                    SecureField("Mật khẩu file .p12", text: $password)
+                        .onChange(of: password) { _, _ in updateP12Check() }
+
+                    if let status = p12CheckText {
+                        Text(status)
+                            .font(.caption.bold())
+                            .foregroundStyle(status.contains("hợp lệ") ? .green : .orange)
+                    }
+
+                    TextField("Tên gợi nhớ (để trống tự lấy)", text: $label)
                 }
             }
             .navigationTitle("Nhập Chứng Chỉ")
@@ -1128,184 +1839,75 @@ struct ImportCertificateSheet: View {
                         )
                         dismiss()
                     }
+                    .fontWeight(.semibold)
                     .disabled(p12URL == nil && provisionURL == nil)
                 }
             }
-            .fileImporter(isPresented: $showFilePicker, allowedContentTypes: [.item]) { result in
-                if case .success(let url) = result {
-                    if pickerTarget == .p12 { p12URL = url } else { provisionURL = url }
-                }
-            }
+        }
+    }
+
+    private func updateP12Check() {
+        guard let url = p12URL else {
+            p12CheckText = nil
+            return
+        }
+        let check = P12Verifier.verify(fileURL: url, password: password)
+        if let name = check.subject, check.status == .verified {
+            p12CheckText = "✓ P12 hợp lệ (\(name))"
+        } else {
+            p12CheckText = check.status.rawValue
         }
     }
 }
 
-// MARK: - Tab 4: Library (Native List)
-struct LibraryTabView: View {
-    @ObservedObject var store: IPAStoreManager
-    @State private var showIPAImporter = false
-    @State private var signingItem: LocalIPAItem?
-
-    var body: some View {
-        NavigationStack {
-            List {
-                if !store.activeDownloads.isEmpty {
-                    Section("Đang tải xuống") {
-                        ForEach(Array(store.activeDownloads.values)) { task in
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack {
-                                    Text(task.appName).font(.headline)
-                                    Spacer()
-                                    Text("\(Int(task.progress * 100))%")
-                                        .font(.caption.monospaced())
-                                        .foregroundStyle(.secondary)
-                                    Button("Hủy", role: .destructive) {
-                                        store.cancelDownload(id: task.id)
-                                    }
-                                    .font(.caption)
-                                }
-                                ProgressView(value: task.progress)
-                            }
-                            .padding(.vertical, 4)
-                        }
-                    }
-                }
-
-                Section("Kho IPA trong máy (\(store.localIPAs.count))") {
-                    if store.localIPAs.isEmpty {
-                        Text("Chưa có file IPA nào. Bấm dấu + để nhập từ Tệp hoặc tải từ tab Apps.")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    } else {
-                        ForEach(store.localIPAs) { item in
-                            Button {
-                                signingItem = item
-                            } label: {
-                                HStack {
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        Text(item.appName)
-                                            .font(.headline)
-                                            .foregroundStyle(.primary)
-                                        Text("\(item.version) • \(item.formattedSize)")
-                                            .font(.caption.monospaced())
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    Spacer()
-                                    Text("Ký / Cài")
-                                        .font(.caption.bold())
-                                        .padding(.horizontal, 10)
-                                        .padding(.vertical, 5)
-                                        .background(Color.accentColor.opacity(0.18))
-                                        .foregroundStyle(Color.accentColor)
-                                        .clipShape(Capsule())
-                                }
-                            }
-                        }
-                        .onDelete(perform: store.deleteLocalIPA)
-                    }
-                }
-            }
-            .navigationTitle("Library")
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        showIPAImporter = true
-                    } label: {
-                        Image(systemName: "plus")
-                    }
-                }
-            }
-            .fileImporter(isPresented: $showIPAImporter, allowedContentTypes: [.item]) { result in
-                if case .success(let url) = result {
-                    store.importLocalIPA(from: url)
-                }
-            }
-            .sheet(item: $signingItem) { item in
-                SignConfigSheet(item: item, store: store)
-            }
-        }
-    }
-}
-
-struct SignConfigSheet: View {
-    let item: LocalIPAItem
-    @ObservedObject var store: IPAStoreManager
-    @Environment(\.dismiss) private var dismiss
-
-    @State private var customName = ""
-    @State private var customBundleID = ""
-    @State private var enableFileSharing = true
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section("Chứng chỉ đang chọn") {
-                    if let cert = store.activeCertificate {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(cert.label).font(.headline)
-                            Text("\(cert.teamName) • \(cert.statusText)")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    } else {
-                        Text("Chưa có chứng chỉ trong tab Certs")
-                            .foregroundStyle(.orange)
-                    }
-                }
-
-                Section("Tùy chỉnh gói") {
-                    TextField("Tên ứng dụng", text: $customName)
-                    TextField("Bundle ID", text: $customBundleID)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    Toggle("Bật Chia sẻ tệp", isOn: $enableFileSharing)
-                }
-
-                Section {
-                    ShareLink(item: store.urlForLocalIPA(item)) {
-                        Label("Gửi sang Feather / LiveContainer / SideStore", systemImage: "square.and.arrow.up")
-                            .frame(maxWidth: .infinity, alignment: .center)
-                    }
-                } footer: {
-                    Text("Chọn Feather, SideStore hoặc LiveContainer trong bảng chia sẻ để ký và cài đặt ngay.")
-                }
-            }
-            .navigationTitle(item.appName)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Xong") { dismiss() }
-                }
-            }
-            .onAppear {
-                customName = item.appName
-                customBundleID = item.bundleID
-            }
-        }
-    }
-}
-
-// MARK: - Tab 5: Settings (Native Form)
+// MARK: - Tab 4: Settings
 struct SettingsTabView: View {
     @ObservedObject var store: IPAStoreManager
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("Tùy chọn") {
+                Section("Chứng chỉ ký") {
+                    NavigationLink {
+                        CertVaultView(store: store)
+                    } label: {
+                        HStack {
+                            Label("Cert Vault", systemImage: "checkmark.seal.fill")
+                            Spacer()
+                            Text(store.activeCertificate?.label ?? "Chưa nhập")
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                }
+
+                Section("Giao diện iOS 27") {
+                    Picker("Chế độ màu", selection: $store.appearance) {
+                        ForEach(AppAppearanceMode.allCases) { mode in
+                            Text(mode.rawValue).tag(mode)
+                        }
+                    }
+                    Picker("Kiểu thẻ ứng dụng", selection: $store.cardStyle) {
+                        ForEach(CardStyleMode.allCases) { style in
+                            Text(style.rawValue).tag(style)
+                        }
+                    }
                     Toggle("Phản hồi rung (Haptics)", isOn: $store.hapticsEnabled)
                 }
 
-                Section("Thống kê") {
-                    LabeledContent("Ứng dụng", value: "\(store.apps.count)")
-                    LabeledContent("Nguồn JSON", value: "\(store.sourceURLs.count)")
-                    LabeledContent("Chứng chỉ", value: "\(store.certificates.count)")
-                    LabeledContent("File IPA trong máy", value: "\(store.localIPAs.count)")
+                Section("Lưu trữ & Bộ nhớ") {
+                    LabeledContent("Ứng dụng từ nguồn", value: "\(store.apps.count)")
+                    LabeledContent("File IPA đã lưu", value: "\(store.localIPAs.count)")
+                    LabeledContent("Tweaks đã lưu", value: "\(store.localTweaks.count)")
+                    LabeledContent("Dung lượng đã dùng", value: ByteCountFormatter.string(fromByteCount: store.totalStorageBytes, countStyle: .file))
+                    Button("Dọn bộ nhớ đệm tạm", role: .destructive) {
+                        store.clearTempCache()
+                    }
                 }
 
                 Section("Thông tin") {
                     LabeledContent("Ứng dụng", value: "TueeHub")
-                    LabeledContent("Phiên bản", value: "2.2 Native")
+                    LabeledContent("Phiên bản", value: "3.0 (iOS 27 Liquid Glass)")
                 }
             }
             .navigationTitle("Settings")
@@ -1313,7 +1915,101 @@ struct SettingsTabView: View {
     }
 }
 
-// MARK: - App Detail Sheet (Native Form)
+// MARK: - Tab 5: Global Search (Nút kính lúp tách rời góc phải)
+struct GlobalSearchView: View {
+    @ObservedObject var store: IPAStoreManager
+    @Binding var query: String
+    @State private var selectedApp: AltApp?
+    @State private var inspectingIPA: LocalIPAItem?
+
+    var matchingApps: [AltApp] {
+        guard !query.isEmpty else { return Array(store.apps.prefix(6)) }
+        return store.apps.filter {
+            $0.name.localizedCaseInsensitiveContains(query) ||
+            $0.safeBundleID.localizedCaseInsensitiveContains(query) ||
+            ($0.subtitle?.localizedCaseInsensitiveContains(query) ?? false)
+        }
+    }
+
+    var matchingIPAs: [LocalIPAItem] {
+        guard !query.isEmpty else { return [] }
+        return store.localIPAs.filter {
+            $0.appName.localizedCaseInsensitiveContains(query) ||
+            $0.bundleID.localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    var matchingTweaks: [LocalTweakItem] {
+        guard !query.isEmpty else { return [] }
+        return store.localTweaks.filter { $0.name.localizedCaseInsensitiveContains(query) }
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if !matchingIPAs.isEmpty {
+                    Section("Library IPA") {
+                        ForEach(matchingIPAs) { item in
+                            Button {
+                                inspectingIPA = item
+                            } label: {
+                                LabeledContent(item.appName, value: item.formattedSize)
+                            }
+                        }
+                    }
+                }
+
+                if !matchingTweaks.isEmpty {
+                    Section("Tweaks") {
+                        ForEach(matchingTweaks) { tweak in
+                            LabeledContent(tweak.name, value: tweak.fileExtension)
+                        }
+                    }
+                }
+
+                Section(query.isEmpty ? "Gợi ý nổi bật" : "Ứng dụng (\(matchingApps.count))") {
+                    ForEach(matchingApps) { app in
+                        Button {
+                            selectedApp = app
+                        } label: {
+                            HStack(spacing: 12) {
+                                AsyncImage(url: URL(string: app.iconURL ?? "")) { phase in
+                                    if let img = phase.image {
+                                        img.resizable().scaledToFill()
+                                    } else {
+                                        Color.secondary.opacity(0.2)
+                                    }
+                                }
+                                .frame(width: 40, height: 40)
+                                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(app.name)
+                                        .font(.headline)
+                                        .foregroundStyle(.primary)
+                                    Text(app.safeBundleID)
+                                        .font(.caption.monospaced())
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Search")
+            .searchable(text: $query, prompt: "Tìm app, IPA, tweak, bundle ID...")
+            .sheet(item: $selectedApp) { app in
+                AppDetailSheet(app: app, store: store)
+            }
+            .sheet(item: $inspectingIPA) { item in
+                IPAInspectorSheet(item: item, store: store)
+            }
+        }
+    }
+}
+
+// MARK: - App Detail Sheet
 struct AppDetailSheet: View {
     let app: AltApp
     @ObservedObject var store: IPAStoreManager
@@ -1330,7 +2026,7 @@ struct AppDetailSheet: View {
                             if let img = phase.image {
                                 img.resizable().scaledToFill()
                             } else {
-                                Color.gray.opacity(0.3)
+                                Color.secondary.opacity(0.25)
                             }
                         }
                         .frame(width: 68, height: 68)
