@@ -1788,7 +1788,8 @@ struct ImportCertificateSheet: View {
                             Label("Chọn file .p12", systemImage: "key.fill")
                             Spacer()
                             Text(p12URL?.lastPathComponent ?? "Bấm để chọn")
-                                .foregroundStyle(p12URL == nil ? .secondary : .blue)
+                                .foregroundStyle(p12URL == nil ? Color.secondary : Color.blue)
+
                                 .lineLimit(1)
                         }
                     }
