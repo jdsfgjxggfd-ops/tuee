@@ -2077,4 +2077,404 @@ struct SignConfigSheet: View {
     let item: LocalIPAItem
     @ObservedObject var store: IPAStoreManager
     let onNeedCert: () -> Void
-    @Environment(\.
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var customName = ""
+    @State private var customBundleID = ""
+    @State private var enableFileSharing = true
+    @State private var removeDeviceLimit = true
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                AuroraBackgroundView(enabled: store.auroraEnabled, theme: store.theme)
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        // Certificate Status Box
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Chứng chỉ đang chọn")
+                                .font(.caption.bold())
+                                .foregroundStyle(Color.white.opacity(0.65))
+                            if let cert = store.activeCertificate {
+                                HStack {
+                                    Image(systemName: cert.isReady ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                                        .foregroundStyle(cert.isReady ? .green : .orange)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(cert.label).font(.subheadline.bold())
+                                        Text("\(cert.teamName) • \(cert.statusText)")
+                                            .font(.caption)
+                                            .foregroundStyle(Color.white.opacity(0.6))
+                                    }
+                                    Spacer()
+                                }
+                            } else {
+                                HStack {
+                                    Text("Chưa có chứng chỉ trong Cert Vault")
+                                        .font(.caption)
+                                        .foregroundStyle(.orange)
+                                    Spacer()
+                                    Button("Nhập ngay", action: onNeedCert)
+                                        .font(.caption.bold())
+                                        .foregroundStyle(store.theme.primary)
+                                }
+                            }
+                        }
+                        .padding(14)
+                        .glassCard(cornerRadius: 18, accent: store.theme.primary)
+
+                        // Signing Customization
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("Cấu hình gói IPA")
+                                .font(.headline)
+                            TextField("Đổi tên hiển thị (tùy chọn)", text: $customName)
+                                .padding(12)
+                                .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.08)))
+                            TextField("Đổi Bundle ID (VD: com.tuee.app)", text: $customBundleID)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                                .padding(12)
+                                .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.08)))
+                            Toggle("Bật Chia sẻ tệp (UIFileSharingEnabled)", isOn: $enableFileSharing)
+                                .font(.subheadline)
+                                .tint(store.theme.primary)
+                            Toggle("Gỡ giới hạn thiết bị (UISupportedDevices)", isOn: $removeDeviceLimit)
+                                .font(.subheadline)
+                                .tint(store.theme.primary)
+                        }
+                        .padding(14)
+                        .glassCard(cornerRadius: 18, accent: store.theme.primary)
+
+                        // Direct Share / Handoff to Feather, LiveContainer, SideStore
+                        ShareLink(item: store.urlForLocalIPA(item)) {
+                            Label("Gửi sang Feather / LiveContainer / SideStore", systemImage: "paperplane.fill")
+                                .font(.headline)
+                                .foregroundStyle(.white)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 14)
+                                .background(RoundedRectangle(cornerRadius: 16).fill(store.theme.gradient))
+                        }
+
+                        Text("Bấm nút trên rồi chọn Feather, SideStore hoặc LiveContainer trong bảng chia sẻ để ký và cài đặt ngay với chứng chỉ của bạn.")
+                            .font(.caption)
+                            .foregroundStyle(Color.white.opacity(0.55))
+                    }
+                    .padding(18)
+                }
+            }
+            .navigationTitle(item.appName)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Đóng") { dismiss() }
+                }
+            }
+        }
+        .onAppear {
+            customName = item.appName
+            customBundleID = item.bundleID
+        }
+        .preferredColorScheme(.dark)
+    }
+}
+
+// MARK: - Tab 5: Settings
+struct SettingsTabView: View {
+    @ObservedObject var store: IPAStoreManager
+
+    var body: some View {
+        ScrollView(showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 18) {
+                Text("Settings")
+                    .font(.system(size: 32, weight: .heavy, design: .rounded))
+                    .padding(.top, 10)
+
+                // Theme Picker
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Chủ đề màu sắc")
+                        .font(.headline)
+                    HStack(spacing: 10) {
+                        ForEach(ThemeAccent.allCases) { item in
+                            let selected = store.theme == item
+                            Button {
+                                store.triggerHaptic(.light)
+                                withAnimation(.easeInOut(duration: 0.25)) { store.theme = item }
+                            } label: {
+                                VStack(spacing: 6) {
+                                    Circle()
+                                        .fill(item.gradient)
+                                        .frame(width: 34, height: 34)
+                                        .overlay(Circle().stroke(selected ? Color.white : Color.clear, lineWidth: 2.5))
+                                    Text(item.rawValue.components(separatedBy: " ").first ?? "")
+                                        .font(.caption2.bold())
+                                        .foregroundStyle(selected ? .white : .white.opacity(0.55))
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 8)
+                                .background(RoundedRectangle(cornerRadius: 14).fill(selected ? Color.white.opacity(0.12) : Color.clear))
+                            }
+                            .buttonStyle(ScalePressStyle())
+                        }
+                    }
+                }
+                .padding(16)
+                .glassCard(cornerRadius: 22, accent: store.theme.primary)
+
+                VStack(spacing: 0) {
+                    Toggle(isOn: $store.auroraEnabled) {
+                        Label("Aurora Glow Background", systemImage: "sparkles")
+                            .font(.subheadline.bold())
+                    }
+                    .tint(store.theme.primary)
+                    .padding(16)
+
+                    Divider().background(Color.white.opacity(0.12))
+
+                    Toggle(isOn: $store.hapticsEnabled) {
+                        Label("Haptic Feedback", systemImage: "iphone.radiowaves.left.and.right")
+                            .font(.subheadline.bold())
+                    }
+                    .tint(store.theme.primary)
+                    .padding(16)
+                }
+                .glassCard(cornerRadius: 22, accent: store.theme.primary)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Thống kê TueeHub v2.2")
+                        .font(.headline)
+                    HStack(spacing: 10) {
+                        StatBadge(title: "Apps", value: "\(store.apps.count)", color: store.theme.primary)
+                        StatBadge(title: "Certs", value: "\(store.certificates.count)", color: store.theme.primary)
+                        StatBadge(title: "Library", value: "\(store.localIPAs.count)", color: store.theme.primary)
+                    }
+                }
+                .padding(16)
+                .glassCard(cornerRadius: 22, accent: store.theme.primary)
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 114)
+        }
+    }
+}
+
+struct StatBadge: View {
+    let title: String
+    let value: String
+    let color: Color
+
+    var body: some View {
+        VStack(spacing: 4) {
+            Text(value)
+                .font(.system(size: 22, weight: .heavy, design: .rounded))
+                .foregroundStyle(color)
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(Color.white.opacity(0.6))
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 12)
+        .background(RoundedRectangle(cornerRadius: 14).fill(Color.white.opacity(0.06)))
+    }
+}
+
+// MARK: - App Detail Sheet
+struct AppDetailSheet: View {
+    let app: AltApp
+    @ObservedObject var store: IPAStoreManager
+    @Environment(\.openURL) private var openURL
+    @Environment(\.dismiss) private var dismiss
+    @State private var copied = false
+
+    var body: some View {
+        ZStack {
+            AuroraBackgroundView(enabled: store.auroraEnabled, theme: store.theme)
+
+            ScrollView(showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 20) {
+                    HStack {
+                        Spacer()
+                        Button { dismiss() } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundStyle(.white.opacity(0.8))
+                                .padding(10)
+                                .background(Circle().fill(Color.white.opacity(0.12)))
+                        }
+                    }
+
+                    HStack(spacing: 16) {
+                        AppIconView(url: app.iconURL, category: app.resolvedCategory, theme: store.theme, size: 80, radius: 20)
+
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text(app.name).font(.title2.bold())
+                            Text(app.developerName ?? "Open-Source Dev")
+                                .font(.subheadline)
+                                .foregroundStyle(Color.white.opacity(0.65))
+                            HStack(spacing: 6) {
+                                Text(app.bestVersion)
+                                Text("•")
+                                Text(app.formattedSize)
+                            }
+                            .font(.caption.bold())
+                            .foregroundStyle(store.theme.primary)
+                        }
+                    }
+
+                    HStack(spacing: 10) {
+                        Button {
+                            if app.isDirectIPA {
+                                store.startIPADownload(for: app)
+                                dismiss()
+                            } else if let url = URL(string: app.bestDownloadURL) {
+                                openURL(url)
+                            }
+                        } label: {
+                            Label(app.isDirectIPA ? "Tải IPA vào Library" : "Mở trang GitHub", systemImage: app.isDirectIPA ? "arrow.down.circle.fill" : "safari.fill")
+                                .font(.headline)
+                                .foregroundStyle(.white)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 14)
+                                .background(RoundedRectangle(cornerRadius: 16).fill(store.theme.gradient))
+                        }
+                        .buttonStyle(ScalePressStyle())
+
+                        Button {
+                            store.toggleFavorite(app)
+                        } label: {
+                            Image(systemName: store.isFavorite(app) ? "heart.fill" : "heart")
+                                .font(.title3)
+                                .foregroundStyle(store.isFavorite(app) ? .pink : .white)
+                                .frame(width: 52, height: 52)
+                                .background(RoundedRectangle(cornerRadius: 16).fill(Color.white.opacity(0.1)))
+                        }
+                        .buttonStyle(ScalePressStyle())
+
+                        Button {
+                            store.triggerHaptic(.light)
+                            UIPasteboard.general.string = app.bestDownloadURL
+                            copied = true
+                        } label: {
+                            Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                                .font(.title3)
+                                .foregroundStyle(copied ? .green : .white)
+                                .frame(width: 52, height: 52)
+                                .background(RoundedRectangle(cornerRadius: 16).fill(Color.white.opacity(0.1)))
+                        }
+                        .buttonStyle(ScalePressStyle())
+                    }
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Mô tả").font(.headline)
+                        Text(app.localizedDescription ?? app.subtitle ?? "Ứng dụng mã nguồn mở từ kho AltSource / GitHub.")
+                            .font(.subheadline)
+                            .foregroundStyle(Color.white.opacity(0.78))
+                            .lineSpacing(4)
+                    }
+                    .padding(16)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .glassCard(cornerRadius: 20, accent: store.theme.primary)
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Thông tin gói").font(.headline)
+                        Text("Bundle ID: \(app.safeBundleID)").font(.caption.monospaced()).foregroundStyle(Color.white.opacity(0.65))
+                        Text("Nguồn: \(app.sourceName ?? "GitHub Official")").font(.caption.monospaced()).foregroundStyle(Color.white.opacity(0.65))
+                        Text("Loại link: \(app.isDirectIPA ? "Direct .ipa (tải trong app)" : "GitHub Release Page")").font(.caption.monospaced()).foregroundStyle(Color.white.opacity(0.65))
+                    }
+                    .padding(16)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .glassCard(cornerRadius: 20, accent: store.theme.primary)
+                }
+                .padding(18)
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+}
+
+// MARK: - Floating Dock & Shared Components
+struct FloatingDockBar: View {
+    @Binding var selectedTab: MainTab
+    let theme: ThemeAccent
+    let activeDownloadsCount: Int
+    let namespace: Namespace.ID
+    let onTap: () -> Void
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(MainTab.allCases, id: \.self) { tab in
+                let isSelected = selectedTab == tab
+                Button {
+                    onTap()
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.78)) { selectedTab = tab }
+                } label: {
+                    VStack(spacing: 4) {
+                        ZStack(alignment: .topTrailing) {
+                            Image(systemName: tab.icon)
+                                .font(.system(size: 18, weight: .semibold))
+                            if tab == .library && activeDownloadsCount > 0 {
+                                Circle()
+                                    .fill(Color.pink)
+                                    .frame(width: 8, height: 8)
+                                    .offset(x: 4, y: -3)
+                            }
+                        }
+                        Text(tab.title)
+                            .font(.system(size: 10, weight: .semibold))
+                            .lineLimit(1)
+                    }
+                    .foregroundStyle(isSelected ? theme.primary : Color.white.opacity(0.62))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 9)
+                    .background(
+                        ZStack {
+                            if isSelected {
+                                Capsule()
+                                    .fill(Color.white.opacity(0.14))
+                                    .overlay(Capsule().stroke(theme.primary.opacity(0.38), lineWidth: 1))
+                                    .matchedGeometryEffect(id: "ACTIVE_DOCK_PILL", in: namespace)
+                            }
+                        }
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            ZStack {
+                Capsule().fill(Color(red: 13/255, green: 18/255, blue: 31/255).opacity(0.86))
+                Capsule().fill(.ultraThinMaterial.opacity(0.6))
+            }
+        )
+        .overlay(
+            Capsule().stroke(LinearGradient(colors: [Color.white.opacity(0.30), Color.white.opacity(0.08)], startPoint: .top, endPoint: .bottom), lineWidth: 1.1)
+        )
+        .shadow(color: Color.black.opacity(0.45), radius: 18, y: 10)
+    }
+}
+
+struct EmptyStateCard: View {
+    let icon: String
+    let title: String
+    let subtitle: String
+
+    var body: some View {
+        VStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 36))
+                .foregroundStyle(Color.white.opacity(0.32))
+            Text(title)
+                .font(.headline)
+                .foregroundStyle(Color.white.opacity(0.75))
+            Text(subtitle)
+                .font(.caption)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(Color.white.opacity(0.48))
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 44)
+        .padding(.horizontal, 20)
+        .glassCard(cornerRadius: 24)
+    }
+}
