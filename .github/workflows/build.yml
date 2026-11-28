@@ -5,6 +5,9 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-26
@@ -45,8 +48,10 @@ jobs:
           cp -r build/Build/Products/Release-iphoneos/MyFirstApp.app Payload/
           zip -r MyFirstApp.ipa Payload
 
-      - name: Upload IPA
-        uses: actions/upload-artifact@v4
-        with:
-          name: MyFirstApp-IPA
-          path: MyFirstApp.ipa
+      - name: Publish IPA to Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" MyFirstApp.ipa \
+            --title "TueeHub IPA #${{ github.run_number }}" \
+            --notes "Tải thẳng file MyFirstApp.ipa bên dưới, không cần giải nén ZIP."
