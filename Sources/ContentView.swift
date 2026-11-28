@@ -448,7 +448,7 @@ enum ZIPArchive {
     }
 }
 
-// MARK: - Mach-O Binary Deep Inspector & URL/Strings Scanner
+// MARK: - Mach-O Binary Inspector, Entitlements Extractor & LC_LOAD_DYLIB Injector
 struct MachOInfo: Sendable {
     let executableName: String
     let executableURL: URL
@@ -461,15 +461,16 @@ struct MachOInfo: Sendable {
     let linkedDylibs: [String]
     let injectedDylibs: [String]
     let rpaths: [String]
+    let entitlementsXML: String?
 }
 
 enum MachOInspector {
-    private static func readU32LE(_ d: Data, _ off: Int) -> UInt32 {
+    fileprivate static func readU32LE(_ d: Data, _ off: Int) -> UInt32 {
         let b = d.startIndex + off
         return UInt32(d[b]) | (UInt32(d[b + 1]) << 8) | (UInt32(d[b + 2]) << 16) | (UInt32(d[b + 3]) << 24)
     }
 
-    private static func readU32BE(_ d: Data, _ off: Int) -> UInt32 {
+    fileprivate static func readU32BE(_ d: Data, _ off: Int) -> UInt32 {
         let b = d.startIndex + off
         return (UInt32(d[b]) << 24) | (UInt32(d[b + 1]) << 16) | (UInt32(d[b + 2]) << 8) | UInt32(d[b + 3])
     }
@@ -489,6 +490,30 @@ enum MachOInspector {
         case 0x0000000C: return "armv7"
         default: return String(format: "0x%X", cpuType)
         }
+    }
+
+    private static func extractEntitlements(handle: FileHandle, sliceOffset: UInt64, dataOff: UInt32, dataSize: UInt32) -> String? {
+        guard dataSize >= 20, dataSize <= 2_500_000 else { return nil }
+        try? handle.seek(toOffset: sliceOffset + UInt64(dataOff))
+        guard let sigData = try? handle.read(upToCount: Int(dataSize)), sigData.count >= 20 else { return nil }
+        guard readU32BE(sigData, 0) == 0xFADE0CC0 else { return nil } // CSMAGIC_EMBEDDED_SIGNATURE
+        let blobCount = Int(readU32BE(sigData, 8))
+        for i in 0..<min(blobCount, 32) {
+            let entryPos = 12 + i * 8
+            guard entryPos + 8 <= sigData.count else { break }
+            let blobOffset = Int(readU32BE(sigData, entryPos + 4))
+            guard blobOffset >= 0, blobOffset + 8 <= sigData.count else { continue }
+            let magic = readU32BE(sigData, blobOffset)
+            let length = Int(readU32BE(sigData, blobOffset + 4))
+            if magic == 0xFADE7171, length > 8, blobOffset + length <= sigData.count {
+                let xmlStart = sigData.startIndex + blobOffset + 8
+                let xmlEnd = sigData.startIndex + blobOffset + length
+                if let xml = String(data: sigData[xmlStart..<xmlEnd], encoding: .utf8) {
+                    return xml.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            }
+        }
+        return nil
     }
 
     static func inspect(binaryURL: URL) -> MachOInfo? {
@@ -537,6 +562,8 @@ enum MachOInspector {
         var sdk: String?
         var dylibs: [String] = []
         var rpaths: [String] = []
+        var codeSigOff: UInt32?
+        var codeSigSize: UInt32?
         var pos = 0
 
         for _ in 0..<ncmds {
@@ -553,6 +580,11 @@ enum MachOInspector {
                 if pos + 20 <= cmdData.count {
                     minOS = decodeVersion(readU32LE(cmdData, pos + 12))
                     sdk = decodeVersion(readU32LE(cmdData, pos + 16))
+                }
+            } else if cmd == 0x1D { // LC_CODE_SIGNATURE
+                if pos + 16 <= cmdData.count {
+                    codeSigOff = readU32LE(cmdData, pos + 8)
+                    codeSigSize = readU32LE(cmdData, pos + 12)
                 }
             } else if cmd == 0x0C || cmd == 0x80000018 || cmd == 0x8000001F || cmd == 0x20 {
                 if pos + 12 <= cmdData.count {
@@ -584,6 +616,13 @@ enum MachOInspector {
             pos += cmdsize
         }
 
+        let entitlements: String?
+        if let off = codeSigOff, let sz = codeSigSize {
+            entitlements = extractEntitlements(handle: handle, sliceOffset: targetOffset, dataOff: off, dataSize: sz)
+        } else {
+            entitlements = nil
+        }
+
         let injected = dylibs.filter {
             $0.hasPrefix("@executable_path") || $0.hasPrefix("@rpath") || $0.hasPrefix("@loader_path") || $0.contains("Substrate") || $0.contains("ElleKit") || $0.contains("Cydia")
         }
@@ -599,8 +638,152 @@ enum MachOInspector {
             sdkVersion: sdk,
             linkedDylibs: dylibs,
             injectedDylibs: injected,
-            rpaths: rpaths
+            rpaths: rpaths,
+            entitlementsXML: entitlements
         )
+    }
+}
+
+enum MachODylibInjector {
+    private static func appendU32LE(_ d: inout Data, _ v: UInt32) {
+        d.append(UInt8(v & 0xFF))
+        d.append(UInt8((v >> 8) & 0xFF))
+        d.append(UInt8((v >> 16) & 0xFF))
+        d.append(UInt8((v >> 24) & 0xFF))
+    }
+
+    static func inject(dylibSourceURL: URL, into appBundleURL: URL, executableName: String, weakLoad: Bool = false) throws -> String {
+        guard dylibSourceURL.pathExtension.lowercased() == "dylib" else {
+            throw ZIPArchiveError.ioFailed("Vui lòng chọn đúng file đuôi .dylib")
+        }
+
+        let fm = FileManager.default
+        let frameworksDir = appBundleURL.appendingPathComponent("Frameworks", isDirectory: true)
+        try fm.createDirectory(at: frameworksDir, withIntermediateDirectories: true)
+
+        let dylibName = dylibSourceURL.lastPathComponent
+        let destDylibURL = frameworksDir.appendingPathComponent(dylibName)
+        if fm.fileExists(atPath: destDylibURL.path) {
+            try fm.removeItem(at: destDylibURL)
+        }
+        try fm.copyItem(at: dylibSourceURL, to: destDylibURL)
+        try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: destDylibURL.path)
+
+        let loadPath = "@executable_path/Frameworks/\(dylibName)"
+        let execURL = appBundleURL.appendingPathComponent(executableName)
+        let handle = try FileHandle(forUpdating: execURL)
+        defer { try? handle.close() }
+
+        try handle.seek(toOffset: 0)
+        guard let probe = try handle.read(upToCount: 4096), probe.count >= 32 else {
+            throw ZIPArchiveError.ioFailed("Không đọc được header Mach-O")
+        }
+
+        let magicLE = MachOInspector.readU32LE(probe, 0)
+        let magicBE = MachOInspector.readU32BE(probe, 0)
+        var sliceOffsets: [UInt64] = []
+
+        if magicBE == 0xCAFEBABE {
+            let nfat = Int(MachOInspector.readU32BE(probe, 4))
+            for i in 0..<min(nfat, 8) {
+                let off = 8 + i * 20
+                guard off + 20 <= probe.count else { break }
+                sliceOffsets.append(UInt64(MachOInspector.readU32BE(probe, off + 8)))
+            }
+        } else if magicLE == 0xFEEDFACF {
+            sliceOffsets.append(0)
+        } else {
+            throw ZIPArchiveError.ioFailed("Binary không phải định dạng Mach-O 64-bit")
+        }
+
+        let pathBytes = Data(loadPath.utf8)
+        let rawCmdSize = 24 + pathBytes.count + 1
+        let alignedCmdSize = ((rawCmdSize + 7) / 8) * 8
+
+        var newCmd = Data(capacity: alignedCmdSize)
+        appendU32LE(&newCmd, weakLoad ? 0x80000018 : 0x0C) // LC_LOAD_WEAK_DYLIB / LC_LOAD_DYLIB
+        appendU32LE(&newCmd, UInt32(alignedCmdSize))
+        appendU32LE(&newCmd, 24) // offset to name string
+        appendU32LE(&newCmd, 2)  // timestamp
+        appendU32LE(&newCmd, 0x00010000) // current version 1.0.0
+        appendU32LE(&newCmd, 0x00010000) // compatibility version 1.0.0
+        newCmd.append(pathBytes)
+        while newCmd.count < alignedCmdSize { newCmd.append(0) }
+
+        var modifiedSlices = 0
+        for sliceOffset in sliceOffsets {
+            try handle.seek(toOffset: sliceOffset)
+            guard let header = try handle.read(upToCount: 32), header.count == 32 else { continue }
+            guard MachOInspector.readU32LE(header, 0) == 0xFEEDFACF else { continue }
+
+            let ncmds = MachOInspector.readU32LE(header, 16)
+            let sizeofcmds = MachOInspector.readU32LE(header, 20)
+            guard let cmdData = try handle.read(upToCount: Int(sizeofcmds)), cmdData.count == Int(sizeofcmds) else {
+                throw ZIPArchiveError.ioFailed("Không đọc được bảng Load Commands")
+            }
+
+            var pos = 0
+            var alreadyLoaded = false
+            var minSectionOffset = UInt32.max
+
+            for _ in 0..<Int(ncmds) {
+                guard pos + 8 <= cmdData.count else { break }
+                let cmd = MachOInspector.readU32LE(cmdData, pos)
+                let cmdsize = Int(MachOInspector.readU32LE(cmdData, pos + 4))
+                guard cmdsize >= 8, pos + cmdsize <= cmdData.count else { break }
+
+                if cmd == 0x0C || cmd == 0x80000018 || cmd == 0x8000001F || cmd == 0x20 {
+                    let strOff = Int(MachOInspector.readU32LE(cmdData, pos + 8))
+                    if strOff < cmdsize {
+                        let start = cmdData.startIndex + pos + strOff
+                        let end = cmdData.startIndex + pos + cmdsize
+                        let slice = cmdData[start..<end]
+                        let stop = slice.firstIndex(of: 0) ?? end
+                        if let existing = String(data: slice[start..<stop], encoding: .utf8), existing == loadPath {
+                            alreadyLoaded = true
+                        }
+                    }
+                } else if cmd == 0x19 && cmdsize >= 72 { // LC_SEGMENT_64
+                    let nsects = Int(MachOInspector.readU32LE(cmdData, pos + 64))
+                    for s in 0..<nsects {
+                        let sectPos = pos + 72 + s * 80
+                        guard sectPos + 52 <= pos + cmdsize else { break }
+                        let fileOff = MachOInspector.readU32LE(cmdData, sectPos + 48)
+                        if fileOff > 0 && fileOff < minSectionOffset {
+                            minSectionOffset = fileOff
+                        }
+                    }
+                }
+                pos += cmdsize
+            }
+
+            if alreadyLoaded { continue }
+
+            let endOfCmds = 32 + Int(sizeofcmds)
+            guard minSectionOffset == UInt32.max || endOfCmds + alignedCmdSize <= Int(minSectionOffset) else {
+                throw ZIPArchiveError.ioFailed("Không đủ khoảng trống header Mach-O để chèn \(dylibName)")
+            }
+
+            try handle.seek(toOffset: sliceOffset + UInt64(endOfCmds))
+            try handle.write(contentsOf: newCmd)
+
+            var updatedCounts = Data(capacity: 8)
+            appendU32LE(&updatedCounts, ncmds + 1)
+            appendU32LE(&updatedCounts, sizeofcmds + UInt32(alignedCmdSize))
+            try handle.seek(toOffset: sliceOffset + 16)
+            try handle.write(contentsOf: updatedCounts)
+            modifiedSlices += 1
+        }
+
+        // Xóa _CodeSignature cũ vì binary đã thay đổi
+        let sigDir = appBundleURL.appendingPathComponent("_CodeSignature")
+        if fm.fileExists(atPath: sigDir.path) {
+            try? fm.removeItem(at: sigDir)
+        }
+
+        return modifiedSlices > 0
+            ? "Đã inject \(loadPath) (\(weakLoad ? "Weak" : "Load")) vào \(modifiedSlices) slice Mach-O"
+            : "Đã cập nhật \(dylibName) (lệnh load đã có sẵn trong Mach-O)"
     }
 }
 
@@ -666,7 +849,7 @@ enum BinaryStringsScanner {
     }
 }
 
-// MARK: - Plist, Provision & Icon Helpers
+// MARK: - Plist, Provision, Localization & Icon Helpers
 enum PlistHelper {
     static func readDict(url: URL) -> [String: Any]? {
         guard let data = try? Data(contentsOf: url),
@@ -711,6 +894,27 @@ enum PlistHelper {
         let tid = ((plist["TeamIdentifier"] as? [String])?.first) ?? "N/A"
         let exp = (plist["ExpirationDate"] as? Date)?.formatted(date: .abbreviated, time: .omitted) ?? "N/A"
         return "\(team) (\(tid)) • Hết hạn: \(exp)"
+    }
+}
+
+enum LocalizationCleaner {
+    static let keepSet: Set<String> = ["base.lproj", "en.lproj", "en-us.lproj", "en_us.lproj", "vi.lproj", "vi-vn.lproj", "vi_vn.lproj"]
+
+    static func removableURLs(in appBundleURL: URL) -> [URL] {
+        let items = (try? FileManager.default.contentsOfDirectory(at: appBundleURL, includingPropertiesForKeys: [.isDirectoryKey])) ?? []
+        return items.filter { url in
+            let lower = url.lastPathComponent.lowercased()
+            return lower.hasSuffix(".lproj") && !keepSet.contains(lower)
+        }
+    }
+
+    static func folderSize(_ url: URL) -> Int64 {
+        guard let e = FileManager.default.enumerator(at: url, includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
+        var sum: Int64 = 0
+        for case let file as URL in e {
+            sum += Int64((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        }
+        return sum
     }
 }
 
@@ -815,6 +1019,7 @@ struct IPAWorkspaceSummary: Sendable {
     let hasWatchDir: Bool
     let hasCodeSignature: Bool
     let urlSchemeCount: Int
+    let removableLprojCount: Int
     let pluginNames: [String]
     let frameworkNames: [String]
     let totalFilesCount: Int
@@ -830,9 +1035,17 @@ struct UndoSnapshotEntry {
     let existedBefore: Bool
 }
 
-// MARK: - AI Providers & Streaming SSE Engine (Full AQ. Vertex AI + Multi-API)
+// MARK: - AI Providers & Dual-Endpoint Streaming SSE Engine
+enum GeminiEndpointMode: String, CaseIterable, Identifiable, Codable, Sendable {
+    case auto = "Tự động"
+    case vertex = "Vertex AI (aiplatform)"
+    case aiStudio = "AI Studio (generativelanguage)"
+
+    var id: String { rawValue }
+}
+
 enum AIProvider: String, CaseIterable, Identifiable, Codable, Sendable {
-    case gemini = "Google Gemini (AQ / Vertex)"
+    case gemini = "Google Gemini"
     case groq = "Groq (Siêu nhanh)"
     case openai = "OpenAI"
     case claude = "Anthropic Claude"
@@ -892,7 +1105,7 @@ enum AIProvider: String, CaseIterable, Identifiable, Codable, Sendable {
 
     var keyPlaceholder: String {
         switch self {
-        case .gemini: return "AQ.Ab8RN... (Vertex / Gemini Key)"
+        case .gemini: return "AQ.Ab8RN... hoặc AIza..."
         case .groq: return "gsk_..."
         case .openai: return "sk-proj-..."
         case .claude: return "sk-ant-..."
@@ -976,6 +1189,7 @@ enum AIClient {
         provider: AIProvider,
         model: String,
         apiKey: String,
+        geminiMode: GeminiEndpointMode,
         customEndpoint: String,
         systemPrompt: String,
         history: [AIChatTurn],
@@ -988,7 +1202,7 @@ enum AIClient {
 
         switch provider {
         case .gemini:
-            return try await streamGemini(model: model, apiKey: cleanKey, systemPrompt: systemPrompt, history: history, onChunk: onChunk)
+            return try await streamGemini(model: model, apiKey: cleanKey, mode: geminiMode, systemPrompt: systemPrompt, history: history, onChunk: onChunk)
         case .claude:
             return try await streamClaude(model: model, apiKey: cleanKey, systemPrompt: systemPrompt, history: history, onChunk: onChunk)
         case .groq, .openai, .deepseek, .grok, .openrouter, .custom:
@@ -1001,6 +1215,7 @@ enum AIClient {
     private static func streamGemini(
         model: String,
         apiKey: String,
+        mode: GeminiEndpointMode,
         systemPrompt: String,
         history: [AIChatTurn],
         onChunk: @escaping @Sendable (String) async -> Void
@@ -1008,62 +1223,95 @@ enum AIClient {
         let cleanModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
         let encodedModel = cleanModel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? cleanModel
 
-        let useVertex = apiKey.hasPrefix("AQ.") || !apiKey.hasPrefix("AIza")
-        let baseStr = useVertex
-            ? "https://aiplatform.googleapis.com/v1/publishers/google/models/\(encodedModel):streamGenerateContent"
-            : "https://generativelanguage.googleapis.com/v1beta/models/\(encodedModel):streamGenerateContent"
+        let vertexBase = "https://aiplatform.googleapis.com/v1/publishers/google/models/\(encodedModel):streamGenerateContent"
+        let aiStudioBase = "https://generativelanguage.googleapis.com/v1beta/models/\(encodedModel):streamGenerateContent"
 
-        guard var comps = URLComponents(string: baseStr) else {
-            throw NSError(domain: "AIClient", code: 400, userInfo: [NSLocalizedDescriptionKey: "Tên model Gemini không hợp lệ."])
+        let candidateBases: [String]
+        switch mode {
+        case .vertex:
+            candidateBases = [vertexBase]
+        case .aiStudio:
+            candidateBases = [aiStudioBase]
+        case .auto:
+            candidateBases = apiKey.hasPrefix("AQ.") ? [vertexBase, aiStudioBase] : [aiStudioBase, vertexBase]
         }
-        comps.queryItems = [
-            URLQueryItem(name: "alt", value: "sse"),
-            URLQueryItem(name: "key", value: apiKey)
-        ]
-        guard let url = comps.url else {
-            throw NSError(domain: "AIClient", code: 400, userInfo: [NSLocalizedDescriptionKey: "Không tạo được URL kết nối Google API."])
-        }
-
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.timeoutInterval = 120
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
         let safeHistory = sanitizeAlternatingTurns(history)
         let contents: [[String: Any]] = safeHistory.map { turn in
             ["role": turn.isUser ? "user" : "model", "parts": [["text": turn.text]]]
         }
-        let body: [String: Any] = [
+        let bodyData = try JSONSerialization.data(withJSONObject: [
             "systemInstruction": ["parts": [["text": systemPrompt]]],
             "contents": contents,
             "generationConfig": ["temperature": 0.2]
-        ]
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        ] as [String: Any])
 
-        let (bytes, response) = try await URLSession.shared.bytes(for: req)
-        try await validateStreamHTTP(response: response, bytes: bytes)
+        var lastError: Error?
 
-        var accumulated = ""
-        for try await line in bytes.lines {
-            if Task.isCancelled { break }
-            guard line.hasPrefix("data:") else { continue }
-            let jsonStr = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-            guard !jsonStr.isEmpty, jsonStr != "[DONE]",
-                  let data = jsonStr.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let candidates = json["candidates"] as? [[String: Any]],
-                  let content = candidates.first?["content"] as? [String: Any],
-                  let parts = content["parts"] as? [[String: Any]] else { continue }
+        for (index, baseStr) in candidateBases.enumerated() {
+            guard var comps = URLComponents(string: baseStr) else { continue }
+            comps.queryItems = [
+                URLQueryItem(name: "alt", value: "sse"),
+                URLQueryItem(name: "key", value: apiKey)
+            ]
+            guard let url = comps.url else { continue }
 
-            for part in parts {
-                if (part["thought"] as? Bool) == true { continue }
-                if let piece = part["text"] as? String, !piece.isEmpty {
-                    accumulated += piece
-                    await onChunk(piece)
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.timeoutInterval = 120
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = bodyData
+
+            do {
+                let (bytes, response) = try await URLSession.shared.bytes(for: req)
+                try await validateStreamHTTP(response: response, bytes: bytes)
+
+                var accumulated = ""
+                for try await line in bytes.lines {
+                    if Task.isCancelled { break }
+                    guard line.hasPrefix("data:") else { continue }
+                    let jsonStr = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+                    guard !jsonStr.isEmpty, jsonStr != "[DONE]",
+                          let data = jsonStr.data(using: .utf8),
+                          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          let candidates = json["candidates"] as? [[String: Any]],
+                          let content = candidates.first?["content"] as? [String: Any],
+                          let parts = content["parts"] as? [[String: Any]] else { continue }
+
+                    for part in parts {
+                        if (part["thought"] as? Bool) == true { continue }
+                        if let piece = part["text"] as? String, !piece.isEmpty {
+                            accumulated += piece
+                            await onChunk(piece)
+                        }
+                    }
                 }
+                return accumulated
+            } catch {
+                lastError = error
+                let code = (error as NSError).code
+                let canFallback = (index + 1 < candidateBases.count) && (code == 403 || code == 401 || code == 404 || code == 400)
+                if canFallback && !Task.isCancelled {
+                    continue
+                }
+                throw enrichGeminiError(error)
             }
         }
-        return accumulated
+
+        throw enrichGeminiError(lastError ?? NSError(domain: "AIClient", code: 500, userInfo: [NSLocalizedDescriptionKey: "Không kết nối được Google API."]))
+    }
+
+    private static func enrichGeminiError(_ error: Error) -> Error {
+        let ns = error as NSError
+        let msg = ns.localizedDescription
+        if ns.code == 403 && (msg.contains("aiplatform.googleapis.com") || msg.contains("PERMISSION_DENIED")) {
+            return NSError(
+                domain: "AIClient",
+                code: 403,
+                userInfo: [NSLocalizedDescriptionKey: "Dự án Google Cloud của key AQ. chưa bật Vertex AI API (aiplatform.googleapis.com). Hãy mở Google Cloud Console → bật Vertex AI API rồi chờ 1–2 phút thử lại.\n\nChi tiết: \(msg)"]
+            )
+        }
+        return error
     }
 
     private static func streamClaude(
@@ -1167,7 +1415,7 @@ enum AIClient {
         var errText = ""
         for try await line in bytes.lines {
             errText += line
-            if errText.count > 420 { break }
+            if errText.count > 460 { break }
         }
         throw NSError(domain: "AIClient", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "Lỗi API (\(http.statusCode)): \(errText)"])
     }
@@ -1335,7 +1583,7 @@ enum AIPatchEngine {
     }
 }
 
-// MARK: - Studio Store Manager
+// MARK: - Studio Store Manager (v5.0)
 @MainActor
 final class IPAStudioManager: ObservableObject {
     @Published var summary: IPAWorkspaceSummary?
@@ -1348,6 +1596,7 @@ final class IPAStudioManager: ObservableObject {
     @Published var pinnedFilesForAI: [String] = []
     @Published var scannedBinaryURLs: [String] = []
     @Published var includeBinaryURLsInAI = false
+    @Published var includeEntitlementsInAI = false
     @Published var isScanningBinary = false
     @Published var canUndo = false
     @Published var iconRefreshID = UUID()
@@ -1358,6 +1607,9 @@ final class IPAStudioManager: ObservableObject {
     }
     @Published var selectedModel: String = "gemini-3.8-flash" {
         didSet { UserDefaults.standard.set(selectedModel, forKey: modelKey) }
+    }
+    @Published var geminiEndpointMode: GeminiEndpointMode = .auto {
+        didSet { UserDefaults.standard.set(geminiEndpointMode.rawValue, forKey: geminiModeKey) }
     }
     @Published var contextDepth: AIContextDepth = .fast {
         didSet { UserDefaults.standard.set(contextDepth.rawValue, forKey: depthKey) }
@@ -1377,10 +1629,11 @@ final class IPAStudioManager: ObservableObject {
     private var aiStreamTask: Task<Void, Never>?
     private var lastUndoEntries: [UndoSnapshotEntry] = []
 
-    private let providerKey = "IPAStudio_v45_Provider"
-    private let modelKey = "IPAStudio_v45_Model"
-    private let depthKey = "IPAStudio_v45_Depth"
-    private let keysStorageKey = "IPAStudio_v45_APIKeys"
+    private let providerKey = "IPAStudio_v5_Provider"
+    private let modelKey = "IPAStudio_v5_Model"
+    private let geminiModeKey = "IPAStudio_v5_GeminiMode"
+    private let depthKey = "IPAStudio_v5_Depth"
+    private let keysStorageKey = "IPAStudio_v5_APIKeys"
     private let customEndpointKey = "IPAStudio_CustomEndpoint"
     private let compressKey = "IPAStudio_Compress"
 
@@ -1414,17 +1667,21 @@ final class IPAStudioManager: ObservableObject {
         if let savedM = UserDefaults.standard.string(forKey: modelKey), !savedM.isEmpty {
             selectedModel = savedM
         }
+        if let rawMode = UserDefaults.standard.string(forKey: geminiModeKey),
+           let parsedMode = GeminiEndpointMode(rawValue: rawMode) {
+            geminiEndpointMode = parsedMode
+        }
         if let rawD = UserDefaults.standard.string(forKey: depthKey),
            let parsedD = AIContextDepth(rawValue: rawD) {
             contextDepth = parsedD
         }
         if let savedKeys = UserDefaults.standard.dictionary(forKey: keysStorageKey) as? [String: String] {
             apiKeys = savedKeys
-        } else if let legacyKeys = UserDefaults.standard.dictionary(forKey: "IPAStudio_APIKeys") as? [String: String] {
+        } else if let legacyKeys = UserDefaults.standard.dictionary(forKey: "IPAStudio_v45_APIKeys") as? [String: String] {
             var migrated: [String: String] = [:]
             for (k, v) in legacyKeys {
-                if k == "Google Gemini" { migrated[AIProvider.gemini.rawValue] = v }
-                else if k == "Groq" { migrated[AIProvider.groq.rawValue] = v }
+                if k.contains("Gemini") { migrated[AIProvider.gemini.rawValue] = v }
+                else if k.contains("Groq") { migrated[AIProvider.groq.rawValue] = v }
                 else { migrated[k] = v }
             }
             apiKeys = migrated
@@ -1433,14 +1690,6 @@ final class IPAStudioManager: ObservableObject {
         if UserDefaults.standard.object(forKey: compressKey) != nil {
             compressOnExport = UserDefaults.standard.bool(forKey: compressKey)
         }
-        messages = [
-            AIMessage(
-                isUser: false,
-                text: "TueeHub IPA Studio v4.5 đã sẵn sàng hỗ trợ key `AQ.` (Vertex AI) và Groq. Nhập file `.ipa` ở tab **IPA**, rồi quay lại đây ra lệnh soi sâu hoặc tự động chỉnh sửa.",
-                modelBadge: nil,
-                patch: nil
-            )
-        ]
     }
 
     func setAPIKey(_ value: String, for provider: AIProvider) {
@@ -1524,8 +1773,8 @@ final class IPAStudioManager: ObservableObject {
                     }
                 }.value
 
-                busyTitle = "Đang phân tích sâu IPA..."
-                busyDetail = "Soi Info.plist & Mach-O Binary"
+                busyTitle = "Đang phân tích IPA..."
+                busyDetail = "Soi Info.plist, Mach-O & Entitlements"
                 let analyzed = try await Task.detached(priority: .userInitiated) {
                     try Self.analyzeWorkspace(root: destRoot, sourceName: sourceName, originalSize: originalSize, shaShort: sha)
                 }.value
@@ -1534,6 +1783,7 @@ final class IPAStudioManager: ObservableObject {
                 self.pinnedFilesForAI = []
                 self.scannedBinaryURLs = []
                 self.includeBinaryURLsInAI = false
+                self.includeEntitlementsInAI = false
                 self.lastUndoEntries = []
                 self.canUndo = false
                 self.iconRefreshID = UUID()
@@ -1612,6 +1862,7 @@ final class IPAStudioManager: ObservableObject {
         let hasDeviceLimit = plist["UISupportedDevices"] != nil
         let urlTypes = (plist["CFBundleURLTypes"] as? [[String: Any]]) ?? []
         let schemeCount = urlTypes.reduce(0) { $0 + ((($1["CFBundleURLSchemes"] as? [String])?.count) ?? 0) }
+        let removableLproj = LocalizationCleaner.removableURLs(in: appBundle).count
 
         let plugInsDir = appBundle.appendingPathComponent("PlugIns")
         let plugins = (try? fm.contentsOfDirectory(atPath: plugInsDir.path)) ?? []
@@ -1657,6 +1908,7 @@ final class IPAStudioManager: ObservableObject {
             hasWatchDir: hasWatch,
             hasCodeSignature: hasCodeSig,
             urlSchemeCount: schemeCount,
+            removableLprojCount: removableLproj,
             pluginNames: plugins,
             frameworkNames: frameworks,
             totalFilesCount: fileCount,
@@ -1667,7 +1919,62 @@ final class IPAStudioManager: ObservableObject {
         )
     }
 
-    // MARK: - Quick Edits, Icon Replacer, Clone & Bypass Tools
+    // MARK: - v5.0 Mod Tools (Dylib Injection, Localization Cleaner, Icon, Clone, Bypass)
+    func injectDylibIntoBinary(dylibURL: URL, weakLoad: Bool) {
+        guard let sum = summary else { return }
+        let execURL = sum.appBundleURL.appendingPathComponent(sum.executableName)
+        let sigURL = sum.appBundleURL.appendingPathComponent("_CodeSignature")
+        recordUndoSnapshot(for: [execURL, sigURL])
+
+        let appBundle = sum.appBundleURL
+        let execName = sum.executableName
+        isBusy = true
+        busyTitle = "Đang inject \(dylibURL.lastPathComponent)"
+        busyProgress = 0.5
+        busyDetail = "Ghi lệnh LC_LOAD_DYLIB vào header Mach-O..."
+
+        Task {
+            do {
+                let msg = try await Task.detached(priority: .userInitiated) {
+                    try MachODylibInjector.inject(dylibSourceURL: dylibURL, into: appBundle, executableName: execName, weakLoad: weakLoad)
+                }.value
+
+                self.isBusy = false
+                self.changeLog.insert("✓ \(msg)", at: 0)
+                self.refreshWorkspace()
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                self.alertMessage = msg
+            } catch {
+                self.isBusy = false
+                self.alertMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func stripUnusedLocalizations() {
+        guard let sum = summary else { return }
+        let targets = LocalizationCleaner.removableURLs(in: sum.appBundleURL)
+        guard !targets.isEmpty else {
+            alertMessage = "Không có gói ngôn ngữ thừa (.lproj) nào cần xóa."
+            return
+        }
+        recordUndoSnapshot(for: targets)
+
+        var totalFreed: Int64 = 0
+        var removedCount = 0
+        for url in targets {
+            totalFreed += LocalizationCleaner.folderSize(url)
+            if (try? FileManager.default.removeItem(at: url)) != nil {
+                removedCount += 1
+            }
+        }
+        let freedStr = ByteCountFormatter.string(fromByteCount: totalFreed, countStyle: .file)
+        changeLog.insert("✓ Đã xóa \(removedCount) gói ngôn ngữ (giảm \(freedStr))", at: 0)
+        refreshWorkspace()
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        alertMessage = "Đã dọn \(removedCount) thư mục .lproj (giữ lại Base, EN, VI), tiết kiệm \(freedStr)."
+    }
+
     func applyManualEdits(name: String, bundleID: String, version: String, minOS: String, fileSharing: Bool, removeDeviceLimit: Bool) {
         guard let sum = summary, var dict = PlistHelper.readDict(url: sum.infoPlistURL) else { return }
         recordUndoSnapshot(for: [sum.infoPlistURL])
@@ -1831,7 +2138,7 @@ final class IPAStudioManager: ObservableObject {
         }
     }
 
-    // MARK: - File Explorer Helpers
+    // MARK: - File Explorer & Deep Search Helpers
     func listDirectory(_ dirURL: URL) -> [IPAFileNode] {
         guard let sum = summary else { return [] }
         let fm = FileManager.default
@@ -1854,6 +2161,35 @@ final class IPAStudioManager: ObservableObject {
             if $0.isDirectory != $1.isDirectory { return $0.isDirectory }
             return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
         }
+    }
+
+    nonisolated static func searchAllFiles(in appBundleURL: URL, query: String, limit: Int = 120) -> [IPAFileNode] {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return [] }
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(at: appBundleURL, includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey]) else {
+            return []
+        }
+        let rootPath = appBundleURL.standardizedFileURL.path
+        var matches: [IPAFileNode] = []
+
+        for case let url as URL in enumerator {
+            if matches.count >= limit { break }
+            let name = url.lastPathComponent
+            if name.localizedCaseInsensitiveContains(q) {
+                let vals = try? url.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey])
+                let isDir = vals?.isDirectory ?? false
+                let size = Int64(vals?.fileSize ?? 0)
+                let stdPath = url.standardizedFileURL.path
+                var rel = stdPath
+                if stdPath.hasPrefix(rootPath) {
+                    rel = String(stdPath.dropFirst(rootPath.count))
+                    if rel.hasPrefix("/") { rel.removeFirst() }
+                }
+                matches.append(IPAFileNode(url: url, name: name, relativePath: rel, isDirectory: isDir, sizeBytes: size))
+            }
+        }
+        return matches
     }
 
     func injectFiles(_ urls: [URL], into targetDir: URL) {
@@ -1914,6 +2250,9 @@ final class IPAStudioManager: ObservableObject {
         if let m = sum.machO {
             let enc = m.isEncrypted == nil ? "None" : (m.isEncrypted == true ? "ENCRYPTED(cryptid=\(m.cryptID ?? 1))" : "Decrypted(0)")
             lines.append("Mach-O: arch=\(m.architectures.joined(separator: ",")) | FairPlay=\(enc) | SDK=\(m.sdkVersion ?? "N/A") | InjectedDylibs=\(m.injectedDylibs.joined(separator: ", "))")
+            if (includeEntitlementsInAI || contextDepth == .deep), let ent = m.entitlementsXML {
+                lines.append("\n=== ENTITLEMENTS ===\n\(String(ent.prefix(3500)))")
+            }
         }
 
         if includeBinaryURLsInAI && !scannedBinaryURLs.isEmpty {
@@ -1950,7 +2289,7 @@ final class IPAStudioManager: ObservableObject {
 
     private func buildSystemPrompt() -> String {
         """
-        Bạn là chuyên gia iOS Reverse Engineering & IPA Modding trong TueeHub IPA Studio v4.5. Trả lời tiếng Việt ngắn gọn, kỹ thuật chuẩn xác.
+        Bạn là chuyên gia iOS Reverse Engineering & IPA Modding trong TueeHub IPA Studio v5.0. Trả lời tiếng Việt ngắn gọn, kỹ thuật chuẩn xác.
 
         Dữ liệu IPA hiện tại:
         \(buildIPAContext())
@@ -1986,6 +2325,7 @@ final class IPAStudioManager: ObservableObject {
         let provider = selectedProvider
         let primaryModel = selectedModel
         let key = currentAPIKey
+        let mode = geminiEndpointMode
         let endpoint = customEndpoint
         let sysPrompt = buildSystemPrompt()
         let history = messages.suffix(8).map { AIChatTurn(isUser: $0.isUser, text: $0.text) }
@@ -2011,6 +2351,7 @@ final class IPAStudioManager: ObservableObject {
                         provider: provider,
                         model: activeModel,
                         apiKey: key,
+                        geminiMode: mode,
                         customEndpoint: endpoint,
                         systemPrompt: sysPrompt,
                         history: history
@@ -2099,6 +2440,7 @@ final class IPAStudioManager: ObservableObject {
         pinnedFilesForAI = []
         scannedBinaryURLs = []
         includeBinaryURLsInAI = false
+        includeEntitlementsInAI = false
         lastUndoEntries = []
         canUndo = false
         changeLog = []
@@ -2165,7 +2507,7 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Tab 1: IPA Overview, Mach-O Inspector & Quick Tools
+// MARK: - Tab 1: IPA Overview, Mach-O Inspector & v5.0 Mod Tools
 struct IPAOverviewTab: View {
     @ObservedObject var store: IPAStudioManager
 
@@ -2175,13 +2517,14 @@ struct IPAOverviewTab: View {
     @State private var editMinOS = ""
     @State private var editFileSharing = false
     @State private var removeDeviceLimit = false
+    @State private var showDylibInjectDialog = false
 
     var body: some View {
         NavigationStack {
             Group {
                 if let sum = store.summary {
                     List {
-                        // Hero Section (nội dung cuộn tự nhiên dưới nav bar & tab bar)
+                        // Hero Card
                         Section {
                             VStack(spacing: 16) {
                                 HStack(spacing: 14) {
@@ -2239,7 +2582,7 @@ struct IPAOverviewTab: View {
                                 Button {
                                     store.exportEditedIPA()
                                 } label: {
-                                    Label("Đóng gói & Xuất IPA đã sửa", systemImage: "square.and.arrow.up")
+                                    Label("Đóng gói & Xuất IPA", systemImage: "square.and.arrow.up")
                                         .font(.headline)
                                         .frame(maxWidth: .infinity)
                                 }
@@ -2250,13 +2593,13 @@ struct IPAOverviewTab: View {
                             .containerShape(.rect(cornerRadius: 22))
                         }
 
-                        // Mach-O & Binary Scanner
+                        // Mach-O, Dylibs & Entitlements
                         if let m = sum.machO {
-                            Section("Soi Mach-O Binary (\(m.executableName))") {
+                            Section("Mach-O & Binary (\(m.executableName))") {
                                 LabeledContent("Dung lượng Binary", value: ByteCountFormatter.string(fromByteCount: m.fileSizeBytes, countStyle: .file))
                                 LabeledContent("SHA-256", value: sum.sha256Short)
                                 if let sdk = m.sdkVersion {
-                                    LabeledContent("Build SDK / MinOS", value: "iOS \(sdk) / \(m.minOSVersion ?? "N/A")")
+                                    LabeledContent("SDK / MinOS", value: "iOS \(sdk) / \(m.minOSVersion ?? "N/A")")
                                 }
                                 NavigationLink {
                                     DylibListView(machO: m)
@@ -2264,20 +2607,25 @@ struct IPAOverviewTab: View {
                                     LabeledContent("Thư viện Dylib", value: "\(m.injectedDylibs.count) nhúng • \(m.linkedDylibs.count) tổng")
                                 }
                                 NavigationLink {
+                                    EntitlementsViewer(store: store, xml: m.entitlementsXML)
+                                } label: {
+                                    LabeledContent("Entitlements", value: m.entitlementsXML == nil ? "Không có" : "Xem XML")
+                                }
+                                NavigationLink {
                                     BinaryURLScannerView(store: store)
                                 } label: {
-                                    LabeledContent("Quét URL ẩn trong Binary", value: store.scannedBinaryURLs.isEmpty ? "Chưa quét" : "\(store.scannedBinaryURLs.count) link")
+                                    LabeledContent("URL trong Binary", value: store.scannedBinaryURLs.isEmpty ? "Quét" : "\(store.scannedBinaryURLs.count) link")
                                 }
                             }
                         }
 
                         // Chỉnh sửa nhanh Info.plist
-                        Section("Chỉnh sửa nhanh Info.plist") {
+                        Section("Info.plist") {
                             LabeledFieldRow(label: "Tên app", text: $editName, placeholder: "Tên hiển thị")
                             LabeledFieldRow(label: "Bundle ID", text: $editBundleID, placeholder: "com.example.app", isCode: true)
                             LabeledFieldRow(label: "Version", text: $editVersion, placeholder: "1.0", isCode: true)
                             LabeledFieldRow(label: "Min iOS", text: $editMinOS, placeholder: "15.0", isCode: true)
-                            Toggle("Bật Chia sẻ tệp (UIFileSharing)", isOn: $editFileSharing)
+                            Toggle("Chia sẻ tệp (UIFileSharing)", isOn: $editFileSharing)
                             if sum.hasSupportedDevicesLimit {
                                 Toggle("Gỡ giới hạn thiết bị", isOn: $removeDeviceLimit)
                             }
@@ -2291,18 +2639,32 @@ struct IPAOverviewTab: View {
                                     removeDeviceLimit: removeDeviceLimit
                                 )
                             } label: {
-                                Text("Lưu thay đổi Info.plist")
+                                Text("Lưu Info.plist")
                                     .fontWeight(.semibold)
                                     .frame(maxWidth: .infinity)
                             }
                         }
 
-                        // Công cụ Mod 1 chạm
-                        Section("Công cụ Mod 1 chạm (v4.5)") {
+                        // Công cụ Mod v5.0
+                        Section("Công cụ v5.0") {
+                            Button {
+                                showDylibInjectDialog = true
+                            } label: {
+                                Label("Inject .dylib vào Mach-O", systemImage: "syringe")
+                            }
+
                             Button {
                                 store.cleanAllForSideload()
                             } label: {
-                                Label("Tối ưu Sideload (Xóa rác + Bật FileSharing)", systemImage: "wand.and.stars")
+                                Label("Tối ưu Sideload 1 chạm", systemImage: "wand.and.stars")
+                            }
+
+                            if sum.removableLprojCount > 0 {
+                                Button {
+                                    store.stripUnusedLocalizations()
+                                } label: {
+                                    Label("Xóa \(sum.removableLprojCount) gói ngôn ngữ thừa (.lproj)", systemImage: "globe.badge.chevron.backward")
+                                }
                             }
 
                             Button {
@@ -2322,11 +2684,11 @@ struct IPAOverviewTab: View {
                             Button {
                                 store.applyBypassForceUpdate()
                             } label: {
-                                Label("Giả lập Version 99.9.9 (Chặn ép cập nhật)", systemImage: "arrow.up.forward.circle")
+                                Label("Giả lập Version 99.9.9", systemImage: "arrow.up.forward.circle")
                             }
 
                             if sum.hasPlugIns {
-                                Button("Xóa PlugIns (\(sum.pluginNames.count) extension)", role: .destructive) {
+                                Button("Xóa PlugIns (\(sum.pluginNames.count))", role: .destructive) {
                                     store.removeFolderFromApp("PlugIns")
                                 }
                             }
@@ -2336,20 +2698,20 @@ struct IPAOverviewTab: View {
                                 }
                             }
                             if sum.hasCodeSignature {
-                                Button("Xóa chữ ký cũ (_CodeSignature)", role: .destructive) {
+                                Button("Xóa _CodeSignature", role: .destructive) {
                                     store.removeFolderFromApp("_CodeSignature")
                                 }
                             }
                         }
 
                         if let prov = sum.provisionSummary {
-                            Section("Provisioning Profile nhúng sẵn") {
+                            Section("Provisioning Profile") {
                                 Text(prov).font(.caption.monospaced())
                             }
                         }
 
                         if !store.changeLog.isEmpty {
-                            Section("Nhật ký thay đổi") {
+                            Section("Nhật ký") {
                                 ForEach(store.changeLog.prefix(8), id: \.self) { log in
                                     Text(log).font(.caption.monospaced())
                                 }
@@ -2360,11 +2722,30 @@ struct IPAOverviewTab: View {
                     .onChange(of: sum.bundleID) { syncForm(sum) }
                     .onChange(of: sum.displayName) { syncForm(sum) }
                     .onChange(of: sum.version) { syncForm(sum) }
+                    .confirmationDialog("Chọn kiểu Inject Dylib vào Mach-O", isPresented: $showDylibInjectDialog, titleVisibility: .visible) {
+                        Button("LC_LOAD_DYLIB (Chuẩn)") {
+                            NativeFilePicker.shared.pick { urls in
+                                if let first = urls.first {
+                                    store.injectDylibIntoBinary(dylibURL: first, weakLoad: false)
+                                }
+                            }
+                        }
+                        Button("LC_LOAD_WEAK_DYLIB (An toàn)") {
+                            NativeFilePicker.shared.pick { urls in
+                                if let first = urls.first {
+                                    store.injectDylibIntoBinary(dylibURL: first, weakLoad: true)
+                                }
+                            }
+                        }
+                        Button("Hủy", role: .cancel) {}
+                    } message: {
+                        Text("Tệp .dylib sẽ được chép vào Frameworks/ và ghi thẳng lệnh tải vào header Mach-O.")
+                    }
                 } else {
                     ContentUnavailableView {
-                        Label("Chưa mở file IPA", systemImage: "shippingbox.and.arrow.backward")
+                        Label("IPA Studio v5", systemImage: "shippingbox.and.arrow.backward")
                     } description: {
-                        Text("Nhập file .ipa từ app Tệp để giải nén, soi Mach-O/Info.plist và để AI chỉnh sửa tự động.")
+                        Text("Nhập file .ipa từ app Tệp để bắt đầu.")
                     } actions: {
                         Button {
                             NativeFilePicker.shared.pick { urls in
@@ -2427,6 +2808,42 @@ struct IPAOverviewTab: View {
     }
 }
 
+struct EntitlementsViewer: View {
+    @ObservedObject var store: IPAStudioManager
+    let xml: String?
+
+    var body: some View {
+        Group {
+            if let xml = xml {
+                List {
+                    Section {
+                        Toggle("Gửi Entitlements này cho AI", isOn: $store.includeEntitlementsInAI)
+                        Button {
+                            UIPasteboard.general.string = xml
+                        } label: {
+                            Label("Sao chép toàn bộ XML", systemImage: "doc.on.doc")
+                        }
+                    }
+
+                    Section("Nội dung Entitlements") {
+                        Text(xml)
+                            .font(.caption.monospaced())
+                            .textSelection(.enabled)
+                    }
+                }
+            } else {
+                ContentUnavailableView(
+                    "Không có Entitlements",
+                    systemImage: "lock.slash",
+                    description: Text("Binary không có khối LC_CODE_SIGNATURE chứa Entitlements nhúng.")
+                )
+            }
+        }
+        .navigationTitle("Entitlements")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
 struct BinaryURLScannerView: View {
     @ObservedObject var store: IPAStudioManager
     @State private var searchText = ""
@@ -2451,7 +2868,7 @@ struct BinaryURLScannerView: View {
                 .disabled(store.isScanningBinary)
 
                 if !store.scannedBinaryURLs.isEmpty {
-                    Toggle("Gửi danh sách URL này cho AI soi", isOn: $store.includeBinaryURLsInAI)
+                    Toggle("Gửi danh sách URL này cho AI", isOn: $store.includeBinaryURLsInAI)
                 }
             }
 
@@ -2473,7 +2890,7 @@ struct BinaryURLScannerView: View {
             }
         }
         .navigationTitle("URL trong Binary")
-        .searchable(text: $searchText, prompt: "Lọc domain (ads, api, firebase)...")
+        .searchable(text: $searchText, prompt: "Lọc domain...")
         .onAppear {
             if store.scannedBinaryURLs.isEmpty {
                 store.scanBinaryStrings()
@@ -2555,145 +2972,111 @@ struct DylibListView: View {
     }
 }
 
-// MARK: - Tab 2: AI Studio (Pure Liquid Glass Floating Controls & Morphing)
+// MARK: - Tab 2: AI Studio (Minimalist Clean Liquid Glass — Không nút gợi ý rườm rà)
 struct AIStudioTab: View {
     @ObservedObject var store: IPAStudioManager
     @State private var inputText = ""
     @State private var showModelPicker = false
     @Namespace private var glassNamespace
 
-    private let quickPrompts: [(title: String, prompt: String)] = [
-        ("Soi toàn diện", "Soi nhanh toàn bộ file IPA: mã hóa FairPlay, dylib/tweak nhúng, PlugIns thừa và đề xuất chỉnh sửa."),
-        ("Tối ưu Sideload", "Chỉnh gói IPA tối ưu để cài sideload: bật UIFileSharingEnabled, gỡ UISupportedDevices, xóa PlugIns, Watch và _CodeSignature."),
-        ("Soi Ads / Server", "Kiểm tra Frameworks và danh sách URL trích từ Binary xem có SDK quảng cáo hoặc tracking nào không."),
-        ("Đổi Bundle ID", "Tạo gói sửa đổi Bundle ID thành bản nhân bản (thêm đuôi .clone) và đổi tên hiển thị kèm hậu tố Clone.")
-    ]
-
     var body: some View {
         NavigationStack {
             ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 14) {
-                        ForEach(store.messages) { msg in
-                            AIMessageBubble(
-                                message: msg,
-                                canApplyPatch: store.summary != nil,
-                                onApply: { store.applyAIPatch(messageID: msg.id) }
-                            )
-                            .id(msg.id)
+                Group {
+                    if store.messages.isEmpty {
+                        ContentUnavailableView(
+                            "AI Studio",
+                            systemImage: "sparkles",
+                            description: Text(store.summary == nil ? "Nhập một file .ipa hoặc bắt đầu đặt câu hỏi." : "Đang kết nối với \(store.summary?.displayName ?? "IPA").")
+                        )
+                    } else {
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 14) {
+                                ForEach(store.messages) { msg in
+                                    AIMessageBubble(
+                                        message: msg,
+                                        canApplyPatch: store.summary != nil,
+                                        onApply: { store.applyAIPatch(messageID: msg.id) }
+                                    )
+                                    .id(msg.id)
+                                }
+                            }
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 12)
                         }
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 12)
-                }
-                .scrollDismissesKeyboard(.interactively)
-                .onChange(of: store.messages.count) {
-                    if let last = store.messages.last {
-                        withAnimation(.easeOut(duration: 0.2)) {
-                            proxy.scrollTo(last.id, anchor: .bottom)
+                        .scrollDismissesKeyboard(.interactively)
+                        .onChange(of: store.messages.count) {
+                            if let last = store.messages.last {
+                                withAnimation(.easeOut(duration: 0.2)) {
+                                    proxy.scrollTo(last.id, anchor: .bottom)
+                                }
+                            }
                         }
                     }
                 }
                 .safeAreaInset(edge: .top, spacing: 0) {
-                    VStack(spacing: 8) {
-                        GlassEffectContainer(spacing: 10) {
-                            HStack(spacing: 10) {
-                                Button {
-                                    showModelPicker = true
-                                } label: {
-                                    HStack(spacing: 6) {
-                                        Circle()
-                                            .fill(store.currentAPIKey.isEmpty ? Color.orange : Color.green)
-                                            .frame(width: 8, height: 8)
-                                        Text(store.selectedModel)
-                                            .font(.caption.weight(.semibold).monospaced())
-                                            .foregroundStyle(.primary)
-                                            .lineLimit(1)
-                                        Image(systemName: "chevron.down")
-                                            .font(.caption2.weight(.semibold))
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 8)
+                    GlassEffectContainer(spacing: 10) {
+                        HStack(spacing: 10) {
+                            Button {
+                                showModelPicker = true
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Circle()
+                                        .fill(store.currentAPIKey.isEmpty ? Color.orange : Color.green)
+                                        .frame(width: 8, height: 8)
+                                    Text(store.selectedModel)
+                                        .font(.caption.weight(.semibold).monospaced())
+                                        .foregroundStyle(.primary)
+                                        .lineLimit(1)
+                                    Image(systemName: "chevron.down")
+                                        .font(.caption2.weight(.semibold))
+                                        .foregroundStyle(.secondary)
                                 }
-                                .buttonStyle(.plain)
-                                .glassEffect(.regular.interactive(), in: .capsule)
-                                .glassEffectID("modelPicker", in: glassNamespace)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
+                            }
+                            .buttonStyle(.plain)
+                            .glassEffect(.regular.interactive(), in: .capsule)
+                            .glassEffectID("modelPicker", in: glassNamespace)
 
-                                Spacer(minLength: 4)
+                            Spacer(minLength: 4)
 
-                                HStack(spacing: 2) {
-                                    ForEach(AIContextDepth.allCases) { depth in
-                                        let isSelected = store.contextDepth == depth
-                                        Button {
-                                            withAnimation(.snappy) {
-                                                store.contextDepth = depth
-                                            }
-                                        } label: {
-                                            Text(depth.rawValue)
-                                                .font(.caption.weight(.semibold))
-                                                .foregroundStyle(isSelected ? .primary : .secondary)
-                                                .padding(.horizontal, 10)
-                                                .padding(.vertical, 6)
-                                                .background {
-                                                    if isSelected {
-                                                        Capsule()
-                                                            .fill(Color.accentColor.opacity(0.22))
-                                                            .matchedGeometryEffect(id: "depthActivePill", in: glassNamespace)
-                                                    }
+                            HStack(spacing: 2) {
+                                ForEach(AIContextDepth.allCases) { depth in
+                                    let isSelected = store.contextDepth == depth
+                                    Button {
+                                        withAnimation(.snappy) {
+                                            store.contextDepth = depth
+                                        }
+                                    } label: {
+                                        Text(depth.rawValue)
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(isSelected ? .primary : .secondary)
+                                            .padding(.horizontal, 10)
+                                            .padding(.vertical, 6)
+                                            .background {
+                                                if isSelected {
+                                                    Capsule()
+                                                        .fill(Color.accentColor.opacity(0.22))
+                                                        .matchedGeometryEffect(id: "depthActivePill", in: glassNamespace)
                                                 }
-                                        }
-                                        .buttonStyle(.plain)
+                                            }
                                     }
+                                    .buttonStyle(.plain)
                                 }
-                                .padding(3)
-                                .glassEffect(.regular.interactive(), in: .capsule)
-                                .glassEffectID("depthSwitcher", in: glassNamespace)
                             }
-                        }
-                        .padding(.horizontal, 16)
-
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            GlassEffectContainer(spacing: 8) {
-                                HStack(spacing: 8) {
-                                    if !store.pinnedFilesForAI.isEmpty {
-                                        Label("\(store.pinnedFilesForAI.count) tệp", systemImage: "sparkles")
-                                            .font(.caption.weight(.semibold))
-                                            .padding(.horizontal, 11)
-                                            .padding(.vertical, 7)
-                                            .glassEffect(.regular.tint(.purple.opacity(0.22)), in: .capsule)
-                                            .glassEffectID("pinnedFilesBadge", in: glassNamespace)
-                                    }
-                                    if store.includeBinaryURLsInAI && !store.scannedBinaryURLs.isEmpty {
-                                        Label("\(store.scannedBinaryURLs.count) URL", systemImage: "link")
-                                            .font(.caption.weight(.semibold))
-                                            .padding(.horizontal, 11)
-                                            .padding(.vertical, 7)
-                                            .glassEffect(.regular.tint(.accentColor.opacity(0.22)), in: .capsule)
-                                            .glassEffectID("binaryURLsBadge", in: glassNamespace)
-                                    }
-                                    ForEach(quickPrompts, id: \.title) { item in
-                                        Button(item.title) {
-                                            store.sendMessage(item.prompt)
-                                        }
-                                        .font(.caption.weight(.semibold))
-                                        .buttonStyle(.glass)
-                                        .controlSize(.small)
-                                        .disabled(store.isAIThinking)
-                                        .glassEffectID("quick_\(item.title)", in: glassNamespace)
-                                    }
-                                }
-                                .padding(.horizontal, 16)
-                            }
+                            .padding(3)
+                            .glassEffect(.regular.interactive(), in: .capsule)
+                            .glassEffectID("depthSwitcher", in: glassNamespace)
                         }
                     }
-                    .padding(.top, 4)
-                    .padding(.bottom, 6)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 6)
                 }
                 .safeAreaInset(edge: .bottom, spacing: 0) {
                     GlassEffectContainer(spacing: 10) {
                         HStack(alignment: .bottom, spacing: 10) {
-                            TextField("Yêu cầu AI soi hoặc sửa IPA...", text: $inputText, axis: .vertical)
+                            TextField("Nhập yêu cầu...", text: $inputText, axis: .vertical)
                                 .lineLimit(1...4)
                                 .padding(.horizontal, 16)
                                 .padding(.vertical, 10)
@@ -2742,14 +3125,16 @@ struct AIStudioTab: View {
             .navigationTitle("AI Studio")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button {
-                        store.stopAI()
-                        store.messages.removeAll()
-                    } label: {
-                        Image(systemName: "trash")
+                if !store.messages.isEmpty {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button {
+                            store.stopAI()
+                            store.messages.removeAll()
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .accessibilityLabel("Xóa lịch sử trò chuyện")
                     }
-                    .accessibilityLabel("Xóa lịch sử trò chuyện")
                 }
 
                 if store.canUndo {
@@ -2947,11 +3332,10 @@ struct AIModelSelectorSheet: View {
                     .autocorrectionDisabled()
 
                     if store.selectedProvider == .gemini {
-                        let key = store.apiKeys[AIProvider.gemini.rawValue] ?? ""
-                        if !key.isEmpty {
-                            Text(key.hasPrefix("AQ.") ? "✓ Đang dùng cổng Vertex AI Express (AQ.)" : "✓ Đang dùng cổng Google AI Studio")
-                                .font(.caption2.weight(.semibold))
-                                .foregroundStyle(.green)
+                        Picker("Cổng kết nối", selection: $store.geminiEndpointMode) {
+                            ForEach(GeminiEndpointMode.allCases) { m in
+                                Text(m.rawValue).tag(m)
+                            }
                         }
                     }
 
@@ -2974,19 +3358,19 @@ struct AIModelSelectorSheet: View {
     }
 }
 
-// MARK: - Tab 3: Deep IPA File Explorer & Editor
+// MARK: - Tab 3: Deep IPA File Explorer & Global Search
 struct FileExplorerTab: View {
     @ObservedObject var store: IPAStudioManager
 
     var body: some View {
         NavigationStack {
             if let sum = store.summary {
-                FolderBrowserView(folderURL: sum.appBundleURL, title: sum.appBundleURL.lastPathComponent, store: store)
+                FolderBrowserView(folderURL: sum.appBundleURL, title: sum.appBundleURL.lastPathComponent, isRoot: true, store: store)
             } else {
                 ContentUnavailableView(
-                    "Chưa có file IPA để duyệt",
+                    "Chưa có file IPA",
                     systemImage: "folder.badge.questionmark",
-                    description: Text("Vào tab IPA để nhập và giải nén file .ipa trước.")
+                    description: Text("Vào tab IPA để nhập file .ipa trước.")
                 )
                 .navigationTitle("Tệp IPA")
             }
@@ -2997,12 +3381,17 @@ struct FileExplorerTab: View {
 struct FolderBrowserView: View {
     let folderURL: URL
     let title: String
+    var isRoot: Bool = false
     @ObservedObject var store: IPAStudioManager
     @State private var searchText = ""
+    @State private var deepResults: [IPAFileNode] = []
     @State private var refreshTick = 0
 
-    var items: [IPAFileNode] {
+    var displayedItems: [IPAFileNode] {
         _ = refreshTick
+        if !searchText.isEmpty && isRoot {
+            return deepResults
+        }
         let list = store.listDirectory(folderURL)
         guard !searchText.isEmpty else { return list }
         return list.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
@@ -3010,14 +3399,22 @@ struct FolderBrowserView: View {
 
     var body: some View {
         List {
-            ForEach(items) { node in
+            ForEach(displayedItems) { node in
                 if node.isDirectory {
                     NavigationLink {
-                        FolderBrowserView(folderURL: node.url, title: node.name, store: store)
+                        FolderBrowserView(folderURL: node.url, title: node.name, isRoot: false, store: store)
                     } label: {
                         HStack(spacing: 10) {
                             Image(systemName: node.iconName).foregroundStyle(node.iconColor)
-                            Text(node.name).lineLimit(1)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(node.name).lineLimit(1)
+                                if isRoot && !searchText.isEmpty {
+                                    Text(node.relativePath)
+                                        .font(.caption2.monospaced())
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
                         }
                     }
                 } else {
@@ -3028,9 +3425,10 @@ struct FolderBrowserView: View {
                             Image(systemName: node.iconName).foregroundStyle(node.iconColor)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(node.name).lineLimit(1)
-                                Text(node.formattedSize)
+                                Text(isRoot && !searchText.isEmpty ? "\(node.relativePath) • \(node.formattedSize)" : node.formattedSize)
                                     .font(.caption2.monospaced())
                                     .foregroundStyle(.secondary)
+                                    .lineLimit(1)
                             }
                             Spacer()
                             if store.pinnedFilesForAI.contains(node.relativePath) {
@@ -3043,7 +3441,7 @@ struct FolderBrowserView: View {
                 }
             }
             .onDelete { offsets in
-                let list = items
+                let list = displayedItems
                 for idx in offsets {
                     try? FileManager.default.removeItem(at: list[idx].url)
                 }
@@ -3052,7 +3450,20 @@ struct FolderBrowserView: View {
             }
         }
         .navigationTitle(title)
-        .searchable(text: $searchText, prompt: "Tìm tệp trong thư mục...")
+        .searchable(text: $searchText, prompt: isRoot ? "Tìm toàn bộ tệp trong .app..." : "Lọc tệp trong thư mục...")
+        .onChange(of: searchText) {
+            guard isRoot else { return }
+            let query = searchText
+            let rootURL = folderURL
+            Task {
+                let hits = await Task.detached(priority: .userInitiated) {
+                    IPAStudioManager.searchAllFiles(in: rootURL, query: query)
+                }.value
+                if self.searchText == query {
+                    self.deepResults = hits
+                }
+            }
+        }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
@@ -3248,6 +3659,13 @@ struct APISettingsTab: View {
                     Picker("Độ sâu ngữ cảnh", selection: $store.contextDepth) {
                         ForEach(AIContextDepth.allCases) { d in
                             Text(d.rawValue).tag(d)
+                        }
+                    }
+                    if store.selectedProvider == .gemini {
+                        Picker("Cổng Gemini", selection: $store.geminiEndpointMode) {
+                            ForEach(GeminiEndpointMode.allCases) { m in
+                                Text(m.rawValue).tag(m)
+                            }
                         }
                     }
                 }
