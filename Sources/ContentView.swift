@@ -788,7 +788,7 @@ struct IPAFileNode: Identifiable, Hashable, Sendable {
     }
 
     var iconColor: Color {
-        if isDirectory { return .blue }
+        if isDirectory { return .accentColor }
         if isImageFile { return .orange }
         if isTextEditable { return .green }
         let ext = url.pathExtension.lowercased()
@@ -1008,7 +1008,6 @@ enum AIClient {
         let cleanModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
         let encodedModel = cleanModel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? cleanModel
 
-        // Tự động phân luồng: AQ. -> Vertex AI Express v1, AIza -> AI Studio v1beta
         let useVertex = apiKey.hasPrefix("AQ.") || !apiKey.hasPrefix("AIza")
         let baseStr = useVertex
             ? "https://aiplatform.googleapis.com/v1/publishers/google/models/\(encodedModel):streamGenerateContent"
@@ -2039,7 +2038,7 @@ final class IPAStudioManager: ObservableObject {
                     let nsErr = error as NSError
                     let isOverloaded = (nsErr.code == 503 || nsErr.code == 429)
                     if provider == .gemini && isOverloaded && attempt == 1 && !Task.isCancelled {
-                        let fallbackModel = (activeModel == "gemini-3.8-flash-lite") ? "gemini-3.8-flash-lite" : "gemini-3.8-flash-lite"
+                        let fallbackModel = "gemini-3.8-flash-lite"
                         activeModel = fallbackModel
                         await MainActor.run {
                             if let idx = self.messages.firstIndex(where: { $0.id == replyID }) {
@@ -2106,37 +2105,36 @@ final class IPAStudioManager: ObservableObject {
     }
 }
 
-// MARK: - Root ContentView
+// MARK: - Root ContentView (Pure iOS 26+ Liquid Glass TabView)
 struct ContentView: View {
     @StateObject private var store = IPAStudioManager()
 
     var body: some View {
         ZStack {
             TabView {
-                IPAOverviewTab(store: store)
-                    .tabItem {
-                        Label("IPA", systemImage: "shippingbox.fill")
-                    }
+                Tab("IPA", systemImage: "shippingbox.fill") {
+                    IPAOverviewTab(store: store)
+                }
 
-                AIStudioTab(store: store)
-                    .tabItem {
-                        Label("AI Studio", systemImage: "sparkles")
-                    }
+                Tab("AI Studio", systemImage: "sparkles") {
+                    AIStudioTab(store: store)
+                }
 
-                FileExplorerTab(store: store)
-                    .tabItem {
-                        Label("Tệp IPA", systemImage: "folder.fill")
-                    }
+                Tab("Tệp IPA", systemImage: "folder.fill") {
+                    FileExplorerTab(store: store)
+                }
 
-                APISettingsTab(store: store)
-                    .tabItem {
-                        Label("AI API", systemImage: "cpu")
-                    }
+                Tab("AI API", systemImage: "cpu") {
+                    APISettingsTab(store: store)
+                }
             }
+            .tabBarMinimizeBehavior(.onScrollDown)
 
             if store.isBusy {
                 ZStack {
-                    Color.black.opacity(0.55).ignoresSafeArea()
+                    Color.black.opacity(0.28)
+                        .ignoresSafeArea()
+
                     VStack(spacing: 12) {
                         ProgressView(value: store.busyProgress)
                             .progressViewStyle(.linear)
@@ -2149,13 +2147,13 @@ struct ContentView: View {
                             .lineLimit(1)
                             .frame(maxWidth: 240)
                     }
-                    .padding(22)
-                    .background(.regularMaterial)
-                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                    .padding(24)
+                    .glassEffect(.regular, in: .rect(cornerRadius: 28))
                 }
+                .transition(.opacity)
             }
         }
-        .preferredColorScheme(.dark)
+        .animation(.snappy, value: store.isBusy)
         .alert("TueeHub IPA Studio", isPresented: Binding(
             get: { store.alertMessage != nil },
             set: { if !$0 { store.alertMessage = nil } }
@@ -2183,28 +2181,28 @@ struct IPAOverviewTab: View {
             Group {
                 if let sum = store.summary {
                     List {
-                        // Hero Card
+                        // Hero Section (nội dung cuộn tự nhiên dưới nav bar & tab bar)
                         Section {
-                            VStack(spacing: 14) {
+                            VStack(spacing: 16) {
                                 HStack(spacing: 14) {
                                     if let iconURL = sum.iconPath, let img = UIImage(contentsOfFile: iconURL.path) {
                                         Image(uiImage: img)
                                             .resizable()
                                             .scaledToFill()
                                             .frame(width: 64, height: 64)
-                                            .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
+                                            .clipShape(ConcentricRectangle())
                                             .id(store.iconRefreshID)
                                     } else {
                                         Image(systemName: "app.dashed")
-                                            .font(.system(size: 30))
+                                            .font(.title)
+                                            .foregroundStyle(.secondary)
                                             .frame(width: 64, height: 64)
-                                            .background(Color.secondary.opacity(0.18))
-                                            .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
+                                            .background(Color(uiColor: .tertiarySystemFill), in: ConcentricRectangle())
                                     }
 
                                     VStack(alignment: .leading, spacing: 4) {
                                         Text(sum.displayName)
-                                            .font(.title3.bold())
+                                            .font(.title3.weight(.semibold))
                                             .lineLimit(1)
                                         Text(sum.bundleID)
                                             .font(.caption.monospaced())
@@ -2213,25 +2211,23 @@ struct IPAOverviewTab: View {
 
                                         HStack(spacing: 6) {
                                             Text("v\(sum.version)")
-                                                .font(.caption2.bold())
-                                                .padding(.horizontal, 7)
-                                                .padding(.vertical, 2)
-                                                .background(Color.blue.opacity(0.2))
-                                                .foregroundStyle(.blue)
-                                                .clipShape(Capsule())
+                                                .font(.caption2.weight(.semibold))
+                                                .padding(.horizontal, 8)
+                                                .padding(.vertical, 3)
+                                                .background(Color.accentColor.opacity(0.16), in: .capsule)
+                                                .foregroundStyle(.tint)
 
                                             if let enc = sum.machO?.isEncrypted {
                                                 Text(enc ? "FairPlay Mã hóa" : "Đã giải mã")
-                                                    .font(.caption2.bold())
-                                                    .padding(.horizontal, 7)
-                                                    .padding(.vertical, 2)
-                                                    .background((enc ? Color.red : Color.green).opacity(0.2))
+                                                    .font(.caption2.weight(.semibold))
+                                                    .padding(.horizontal, 8)
+                                                    .padding(.vertical, 3)
+                                                    .background((enc ? Color.red : Color.green).opacity(0.16), in: .capsule)
                                                     .foregroundStyle(enc ? .red : .green)
-                                                    .clipShape(Capsule())
                                             }
                                         }
                                     }
-                                    Spacer()
+                                    Spacer(minLength: 0)
                                 }
 
                                 HStack(spacing: 8) {
@@ -2243,14 +2239,15 @@ struct IPAOverviewTab: View {
                                 Button {
                                     store.exportEditedIPA()
                                 } label: {
-                                    Label("Đóng gói & Xuất IPA đã sửa", systemImage: "square.and.arrow.up.fill")
+                                    Label("Đóng gói & Xuất IPA đã sửa", systemImage: "square.and.arrow.up")
                                         .font(.headline)
                                         .frame(maxWidth: .infinity)
-                                        .padding(.vertical, 4)
                                 }
-                                .buttonStyle(.borderedProminent)
+                                .buttonStyle(.glassProminent)
+                                .controlSize(.large)
                             }
                             .padding(.vertical, 4)
+                            .containerShape(.rect(cornerRadius: 22))
                         }
 
                         // Mach-O & Binary Scanner
@@ -2300,7 +2297,7 @@ struct IPAOverviewTab: View {
                             }
                         }
 
-                        // Công cụ v4.5: 1 chạm
+                        // Công cụ Mod 1 chạm
                         Section("Công cụ Mod 1 chạm (v4.5)") {
                             Button {
                                 store.cleanAllForSideload()
@@ -2360,40 +2357,29 @@ struct IPAOverviewTab: View {
                         }
                     }
                     .onAppear { syncForm(sum) }
-                    .onChange(of: sum.bundleID) { _ in syncForm(sum) }
-                    .onChange(of: sum.displayName) { _ in syncForm(sum) }
-                    .onChange(of: sum.version) { _ in syncForm(sum) }
+                    .onChange(of: sum.bundleID) { syncForm(sum) }
+                    .onChange(of: sum.displayName) { syncForm(sum) }
+                    .onChange(of: sum.version) { syncForm(sum) }
                 } else {
-                    EmptyWorkspaceView(
-                        icon: "shippingbox.and.arrow.backward",
-                        title: "Chưa mở file IPA",
-                        subtitle: "Nhập file .ipa từ app Tệp để giải nén, soi Mach-O/Info.plist và để AI chỉnh sửa tự động.",
-                        actionTitle: "Nhập file .IPA"
-                    ) {
-                        NativeFilePicker.shared.pick { urls in
-                            if let first = urls.first { store.importIPA(from: first) }
+                    ContentUnavailableView {
+                        Label("Chưa mở file IPA", systemImage: "shippingbox.and.arrow.backward")
+                    } description: {
+                        Text("Nhập file .ipa từ app Tệp để giải nén, soi Mach-O/Info.plist và để AI chỉnh sửa tự động.")
+                    } actions: {
+                        Button {
+                            NativeFilePicker.shared.pick { urls in
+                                if let first = urls.first { store.importIPA(from: first) }
+                            }
+                        } label: {
+                            Label("Nhập file .IPA", systemImage: "plus")
                         }
+                        .buttonStyle(.glassProminent)
+                        .controlSize(.large)
                     }
                 }
             }
             .navigationTitle("IPA Studio")
             .toolbar {
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    if store.canUndo {
-                        Button {
-                            store.performUndo()
-                        } label: {
-                            Image(systemName: "arrow.uturn.backward")
-                        }
-                    }
-                    Button {
-                        NativeFilePicker.shared.pick { urls in
-                            if let first = urls.first { store.importIPA(from: first) }
-                        }
-                    } label: {
-                        Image(systemName: "plus")
-                    }
-                }
                 if store.summary != nil {
                     ToolbarItem(placement: .topBarLeading) {
                         Button(role: .destructive) {
@@ -2401,7 +2387,31 @@ struct IPAOverviewTab: View {
                         } label: {
                             Image(systemName: "trash")
                         }
+                        .accessibilityLabel("Đóng workspace")
                     }
+                }
+
+                if store.canUndo {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button {
+                            store.performUndo()
+                        } label: {
+                            Image(systemName: "arrow.uturn.backward")
+                        }
+                        .accessibilityLabel("Hoàn tác")
+                    }
+                    ToolbarSpacer(.fixed, placement: .topBarTrailing)
+                }
+
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        NativeFilePicker.shared.pick { urls in
+                            if let first = urls.first { store.importIPA(from: first) }
+                        }
+                    } label: {
+                        Image(systemName: "plus")
+                    }
+                    .accessibilityLabel("Nhập file IPA")
                 }
             }
         }
@@ -2479,16 +2489,15 @@ struct QuickStatTile: View {
     var body: some View {
         VStack(spacing: 3) {
             Text(value)
-                .font(.subheadline.bold().monospaced())
+                .font(.subheadline.weight(.semibold).monospaced())
                 .lineLimit(1)
             Text(title)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
-        .padding(.vertical, 8)
-        .background(Color(uiColor: .tertiarySystemGroupedBackground))
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .padding(.vertical, 9)
+        .background(Color(uiColor: .tertiarySystemFill), in: ConcentricRectangle())
     }
 }
 
@@ -2509,40 +2518,6 @@ struct LabeledFieldRow: View {
                 .autocorrectionDisabled()
                 .textInputAutocapitalization(isCode ? .never : .sentences)
         }
-    }
-}
-
-struct EmptyWorkspaceView: View {
-    let icon: String
-    let title: String
-    let subtitle: String
-    var actionTitle: String? = nil
-    var action: (() -> Void)? = nil
-
-    var body: some View {
-        VStack(spacing: 14) {
-            Image(systemName: icon)
-                .font(.system(size: 50))
-                .foregroundStyle(.blue)
-            Text(title)
-                .font(.title3.bold())
-            Text(subtitle)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 32)
-            if let actionTitle = actionTitle, let action = action {
-                Button(action: action) {
-                    Label(actionTitle, systemImage: "plus.circle.fill")
-                        .font(.headline)
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 10)
-                }
-                .buttonStyle(.borderedProminent)
-                .padding(.top, 4)
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
@@ -2580,11 +2555,12 @@ struct DylibListView: View {
     }
 }
 
-// MARK: - Tab 2: AI Studio (Streaming SSE + Auto 503 Fallback)
+// MARK: - Tab 2: AI Studio (Pure Liquid Glass Floating Controls & Morphing)
 struct AIStudioTab: View {
     @ObservedObject var store: IPAStudioManager
     @State private var inputText = ""
     @State private var showModelPicker = false
+    @Namespace private var glassNamespace
 
     private let quickPrompts: [(title: String, prompt: String)] = [
         ("Soi toàn diện", "Soi nhanh toàn bộ file IPA: mã hóa FairPlay, dylib/tweak nhúng, PlugIns thừa và đề xuất chỉnh sửa."),
@@ -2595,157 +2571,177 @@ struct AIStudioTab: View {
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 0) {
-                HStack(spacing: 8) {
-                    Button {
-                        showModelPicker = true
-                    } label: {
-                        HStack(spacing: 6) {
-                            Circle()
-                                .fill(store.currentAPIKey.isEmpty ? Color.orange : Color.green)
-                                .frame(width: 8, height: 8)
-                            Text(store.selectedModel)
-                                .font(.caption.bold().monospaced())
-                                .foregroundStyle(.primary)
-                                .lineLimit(1)
-                            Image(systemName: "chevron.down")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                        .padding(.horizontal, 11)
-                        .padding(.vertical, 7)
-                        .background(Color(uiColor: .secondarySystemGroupedBackground))
-                        .clipShape(Capsule())
-                    }
-
-                    Spacer()
-
-                    Picker("Ngữ cảnh", selection: $store.contextDepth) {
-                        ForEach(AIContextDepth.allCases) { d in
-                            Text(d.rawValue).tag(d)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 14) {
+                        ForEach(store.messages) { msg in
+                            AIMessageBubble(
+                                message: msg,
+                                canApplyPatch: store.summary != nil,
+                                onApply: { store.applyAIPatch(messageID: msg.id) }
+                            )
+                            .id(msg.id)
                         }
                     }
-                    .pickerStyle(.segmented)
-                    .frame(width: 118)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        if !store.pinnedFilesForAI.isEmpty {
-                            Text("✨ \(store.pinnedFilesForAI.count) tệp")
-                                .font(.caption.bold())
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 6)
-                                .background(Color.purple.opacity(0.2))
-                                .foregroundStyle(.purple)
-                                .clipShape(Capsule())
+                .scrollDismissesKeyboard(.interactively)
+                .onChange(of: store.messages.count) {
+                    if let last = store.messages.last {
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            proxy.scrollTo(last.id, anchor: .bottom)
                         }
-                        if store.includeBinaryURLsInAI && !store.scannedBinaryURLs.isEmpty {
-                            Text("🔗 \(store.scannedBinaryURLs.count) URL")
-                                .font(.caption.bold())
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 6)
-                                .background(Color.blue.opacity(0.2))
-                                .foregroundStyle(.blue)
-                                .clipShape(Capsule())
-                        }
-                        ForEach(quickPrompts, id: \.title) { item in
-                            Button {
-                                store.sendMessage(item.prompt)
-                            } label: {
-                                Text(item.title)
-                                    .font(.caption.weight(.semibold))
+                    }
+                }
+                .safeAreaInset(edge: .top, spacing: 0) {
+                    VStack(spacing: 8) {
+                        GlassEffectContainer(spacing: 10) {
+                            HStack(spacing: 10) {
+                                Button {
+                                    showModelPicker = true
+                                } label: {
+                                    HStack(spacing: 6) {
+                                        Circle()
+                                            .fill(store.currentAPIKey.isEmpty ? Color.orange : Color.green)
+                                            .frame(width: 8, height: 8)
+                                        Text(store.selectedModel)
+                                            .font(.caption.weight(.semibold).monospaced())
+                                            .foregroundStyle(.primary)
+                                            .lineLimit(1)
+                                        Image(systemName: "chevron.down")
+                                            .font(.caption2.weight(.semibold))
+                                            .foregroundStyle(.secondary)
+                                    }
                                     .padding(.horizontal, 12)
-                                    .padding(.vertical, 6)
-                                    .background(Color(uiColor: .secondarySystemGroupedBackground))
-                                    .foregroundStyle(.primary)
-                                    .clipShape(Capsule())
+                                    .padding(.vertical, 8)
+                                }
+                                .buttonStyle(.plain)
+                                .glassEffect(.regular.interactive(), in: .capsule)
+                                .glassEffectID("modelPicker", in: glassNamespace)
+
+                                Spacer(minLength: 4)
+
+                                HStack(spacing: 2) {
+                                    ForEach(AIContextDepth.allCases) { depth in
+                                        let isSelected = store.contextDepth == depth
+                                        Button {
+                                            withAnimation(.snappy) {
+                                                store.contextDepth = depth
+                                            }
+                                        } label: {
+                                            Text(depth.rawValue)
+                                                .font(.caption.weight(.semibold))
+                                                .foregroundStyle(isSelected ? .primary : .secondary)
+                                                .padding(.horizontal, 10)
+                                                .padding(.vertical, 6)
+                                                .background {
+                                                    if isSelected {
+                                                        Capsule()
+                                                            .fill(Color.accentColor.opacity(0.22))
+                                                            .matchedGeometryEffect(id: "depthActivePill", in: glassNamespace)
+                                                    }
+                                                }
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                                .padding(3)
+                                .glassEffect(.regular.interactive(), in: .capsule)
+                                .glassEffectID("depthSwitcher", in: glassNamespace)
                             }
-                            .disabled(store.isAIThinking)
                         }
-                    }
-                    .padding(.horizontal, 14)
-                    .padding(.bottom, 8)
-                }
+                        .padding(.horizontal, 16)
 
-                Divider()
-
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 14) {
-                            ForEach(store.messages) { msg in
-                                AIMessageBubble(
-                                    message: msg,
-                                    canApplyPatch: store.summary != nil,
-                                    onApply: { store.applyAIPatch(messageID: msg.id) }
-                                )
-                                .id(msg.id)
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            GlassEffectContainer(spacing: 8) {
+                                HStack(spacing: 8) {
+                                    if !store.pinnedFilesForAI.isEmpty {
+                                        Label("\(store.pinnedFilesForAI.count) tệp", systemImage: "sparkles")
+                                            .font(.caption.weight(.semibold))
+                                            .padding(.horizontal, 11)
+                                            .padding(.vertical, 7)
+                                            .glassEffect(.regular.tint(.purple.opacity(0.22)), in: .capsule)
+                                            .glassEffectID("pinnedFilesBadge", in: glassNamespace)
+                                    }
+                                    if store.includeBinaryURLsInAI && !store.scannedBinaryURLs.isEmpty {
+                                        Label("\(store.scannedBinaryURLs.count) URL", systemImage: "link")
+                                            .font(.caption.weight(.semibold))
+                                            .padding(.horizontal, 11)
+                                            .padding(.vertical, 7)
+                                            .glassEffect(.regular.tint(.accentColor.opacity(0.22)), in: .capsule)
+                                            .glassEffectID("binaryURLsBadge", in: glassNamespace)
+                                    }
+                                    ForEach(quickPrompts, id: \.title) { item in
+                                        Button(item.title) {
+                                            store.sendMessage(item.prompt)
+                                        }
+                                        .font(.caption.weight(.semibold))
+                                        .buttonStyle(.glass)
+                                        .controlSize(.small)
+                                        .disabled(store.isAIThinking)
+                                        .glassEffectID("quick_\(item.title)", in: glassNamespace)
+                                    }
+                                }
+                                .padding(.horizontal, 16)
                             }
                         }
-                        .padding(14)
                     }
-                    .onChange(of: store.messages.count) { _ in
-                        if let last = store.messages.last {
-                            withAnimation(.easeOut(duration: 0.2)) {
-                                proxy.scrollTo(last.id, anchor: .bottom)
+                    .padding(.top, 4)
+                    .padding(.bottom, 6)
+                }
+                .safeAreaInset(edge: .bottom, spacing: 0) {
+                    GlassEffectContainer(spacing: 10) {
+                        HStack(alignment: .bottom, spacing: 10) {
+                            TextField("Yêu cầu AI soi hoặc sửa IPA...", text: $inputText, axis: .vertical)
+                                .lineLimit(1...4)
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 10)
+                                .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 22))
+                                .glassEffectID("composerField", in: glassNamespace)
+
+                            if store.isAIThinking {
+                                Button {
+                                    withAnimation(.snappy) {
+                                        store.stopAI()
+                                    }
+                                } label: {
+                                    Image(systemName: "stop.fill")
+                                        .font(.body.weight(.semibold))
+                                        .frame(width: 24, height: 24)
+                                }
+                                .buttonStyle(.glassProminent)
+                                .buttonBorderShape(.circle)
+                                .tint(.red)
+                                .glassEffectID("composerAction", in: glassNamespace)
+                                .accessibilityLabel("Dừng phản hồi AI")
+                            } else {
+                                Button {
+                                    let text = inputText
+                                    inputText = ""
+                                    withAnimation(.snappy) {
+                                        store.sendMessage(text)
+                                    }
+                                } label: {
+                                    Image(systemName: "arrow.up")
+                                        .font(.body.weight(.semibold))
+                                        .frame(width: 24, height: 24)
+                                }
+                                .buttonStyle(.glassProminent)
+                                .buttonBorderShape(.circle)
+                                .disabled(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                                .glassEffectID("composerAction", in: glassNamespace)
+                                .accessibilityLabel("Gửi yêu cầu")
                             }
                         }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
                     }
                 }
-
-                Divider()
-
-                HStack(spacing: 10) {
-                    TextField("Yêu cầu AI soi hoặc sửa IPA...", text: $inputText, axis: .vertical)
-                        .lineLimit(1...4)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 9)
-                        .background(Color(uiColor: .secondarySystemGroupedBackground))
-                        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-
-                    if store.isAIThinking {
-                        Button {
-                            store.stopAI()
-                        } label: {
-                            Image(systemName: "stop.circle.fill")
-                                .font(.system(size: 32))
-                                .foregroundStyle(.red)
-                        }
-                    } else {
-                        Button {
-                            let text = inputText
-                            inputText = ""
-                            store.sendMessage(text)
-                        } label: {
-                            Image(systemName: "arrow.up.circle.fill")
-                                .font(.system(size: 32))
-                                .foregroundStyle(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .gray : .blue)
-                        }
-                        .disabled(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    }
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
             }
             .navigationTitle("AI Studio")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    if store.canUndo {
-                        Button {
-                            store.performUndo()
-                        } label: {
-                            Image(systemName: "arrow.uturn.backward")
-                        }
-                    }
-                    Button {
-                        showModelPicker = true
-                    } label: {
-                        Image(systemName: "slider.horizontal.3")
-                    }
-                }
                 ToolbarItem(placement: .topBarLeading) {
                     Button {
                         store.stopAI()
@@ -2753,6 +2749,28 @@ struct AIStudioTab: View {
                     } label: {
                         Image(systemName: "trash")
                     }
+                    .accessibilityLabel("Xóa lịch sử trò chuyện")
+                }
+
+                if store.canUndo {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button {
+                            store.performUndo()
+                        } label: {
+                            Image(systemName: "arrow.uturn.backward")
+                        }
+                        .accessibilityLabel("Hoàn tác")
+                    }
+                    ToolbarSpacer(.fixed, placement: .topBarTrailing)
+                }
+
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        showModelPicker = true
+                    } label: {
+                        Image(systemName: "slider.horizontal.3")
+                    }
+                    .accessibilityLabel("Chọn model AI")
                 }
             }
             .sheet(isPresented: $showModelPicker) {
@@ -2768,14 +2786,14 @@ struct AIMessageBubble: View {
     let onApply: () -> Void
 
     var body: some View {
-        VStack(alignment: message.isUser ? .trailing : .leading, spacing: 6) {
+        VStack(alignment: message.isUser ? .trailing : .leading, spacing: 8) {
             if let badge = message.modelBadge {
                 HStack(spacing: 6) {
                     Text(badge)
                         .font(.caption2.monospaced())
                         .foregroundStyle(.secondary)
                     if message.isStreaming {
-                        ProgressView().scaleEffect(0.65)
+                        ProgressView().controlSize(.mini)
                     }
                 }
             }
@@ -2783,7 +2801,7 @@ struct AIMessageBubble: View {
             Group {
                 if message.text.isEmpty && message.isStreaming {
                     HStack(spacing: 8) {
-                        ProgressView().scaleEffect(0.8)
+                        ProgressView().controlSize(.small)
                         Text("Đang kết nối...")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
@@ -2794,10 +2812,13 @@ struct AIMessageBubble: View {
                         .textSelection(.enabled)
                 }
             }
-            .padding(12)
-            .background(message.isUser ? Color.blue : Color(uiColor: .secondarySystemGroupedBackground))
-            .foregroundStyle(message.isUser ? .white : .primary)
-            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 11)
+            .background(
+                message.isUser ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Color(uiColor: .secondarySystemGroupedBackground)),
+                in: .rect(cornerRadius: 20)
+            )
+            .foregroundStyle(message.isUser ? Color.white : Color.primary)
             .contextMenu {
                 Button {
                     UIPasteboard.general.string = message.text
@@ -2807,20 +2828,22 @@ struct AIMessageBubble: View {
             }
 
             if let patch = message.patch {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 6) {
                         Image(systemName: "wand.and.stars")
                             .foregroundStyle(.green)
                         Text(patch.summary ?? "Gói chỉnh sửa AI (\(patch.actions.count) bước)")
-                            .font(.subheadline.bold())
+                            .font(.subheadline.weight(.semibold))
                     }
 
-                    ForEach(patch.actions) { act in
-                        HStack(alignment: .top, spacing: 6) {
-                            Text("•").foregroundStyle(.blue)
-                            Text(act.displayTitle)
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(patch.actions) { act in
+                            HStack(alignment: .top, spacing: 6) {
+                                Text("•").foregroundStyle(.tint)
+                                Text(act.displayTitle)
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
 
@@ -2829,16 +2852,16 @@ struct AIMessageBubble: View {
                             message.patchApplied ? "Đã áp dụng vào IPA" : "Áp dụng ngay vào IPA",
                             systemImage: message.patchApplied ? "checkmark.circle.fill" : "bolt.fill"
                         )
-                        .font(.subheadline.bold())
+                        .font(.subheadline.weight(.semibold))
                         .frame(maxWidth: .infinity)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .tint(message.patchApplied ? .green : .blue)
+                    .buttonStyle(.glassProminent)
+                    .tint(message.patchApplied ? .green : .accentColor)
                     .disabled(!canApplyPatch || message.patchApplied)
                 }
-                .padding(12)
-                .background(Color(uiColor: .tertiarySystemGroupedBackground))
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .padding(14)
+                .background(Color(uiColor: .secondarySystemGroupedBackground), in: .rect(cornerRadius: 22))
+                .containerShape(.rect(cornerRadius: 22))
             }
         }
         .frame(maxWidth: .infinity, alignment: message.isUser ? .trailing : .leading)
@@ -2864,11 +2887,12 @@ struct AIModelSelectorSheet: View {
                                 Spacer()
                                 if !(store.apiKeys[provider.rawValue] ?? "").isEmpty {
                                     Text("Sẵn sàng")
-                                        .font(.caption2.bold())
+                                        .font(.caption2.weight(.semibold))
                                         .foregroundStyle(.green)
                                 }
                                 if store.selectedProvider == provider {
-                                    Image(systemName: "checkmark").foregroundStyle(.blue)
+                                    Image(systemName: "checkmark")
+                                        .foregroundStyle(.tint)
                                 }
                             }
                         }
@@ -2886,7 +2910,8 @@ struct AIModelSelectorSheet: View {
                                     .foregroundStyle(.primary)
                                 Spacer()
                                 if store.selectedModel == m {
-                                    Image(systemName: "checkmark").foregroundStyle(.blue)
+                                    Image(systemName: "checkmark")
+                                        .foregroundStyle(.tint)
                                 }
                             }
                         }
@@ -2904,6 +2929,8 @@ struct AIModelSelectorSheet: View {
                                 customModelInput = ""
                             }
                         }
+                        .buttonStyle(.glass)
+                        .controlSize(.small)
                         .disabled(customModelInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
                 }
@@ -2923,7 +2950,7 @@ struct AIModelSelectorSheet: View {
                         let key = store.apiKeys[AIProvider.gemini.rawValue] ?? ""
                         if !key.isEmpty {
                             Text(key.hasPrefix("AQ.") ? "✓ Đang dùng cổng Vertex AI Express (AQ.)" : "✓ Đang dùng cổng Google AI Studio")
-                                .font(.caption2.bold())
+                                .font(.caption2.weight(.semibold))
                                 .foregroundStyle(.green)
                         }
                     }
@@ -2939,8 +2966,8 @@ struct AIModelSelectorSheet: View {
             .navigationTitle("Chọn Model & API")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Xong") { dismiss() }.fontWeight(.semibold)
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Xong") { dismiss() }
                 }
             }
         }
@@ -2956,10 +2983,10 @@ struct FileExplorerTab: View {
             if let sum = store.summary {
                 FolderBrowserView(folderURL: sum.appBundleURL, title: sum.appBundleURL.lastPathComponent, store: store)
             } else {
-                EmptyWorkspaceView(
-                    icon: "folder.badge.questionmark",
-                    title: "Chưa có file IPA để duyệt",
-                    subtitle: "Vào tab IPA để nhập và giải nén file .ipa trước."
+                ContentUnavailableView(
+                    "Chưa có file IPA để duyệt",
+                    systemImage: "folder.badge.questionmark",
+                    description: Text("Vào tab IPA để nhập và giải nén file .ipa trước.")
                 )
                 .navigationTitle("Tệp IPA")
             }
@@ -3036,6 +3063,7 @@ struct FolderBrowserView: View {
                 } label: {
                     Image(systemName: "doc.badge.plus")
                 }
+                .accessibilityLabel("Chèn tệp vào thư mục")
             }
         }
     }
@@ -3055,18 +3083,10 @@ struct FileDetailEditorView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            if let notice = saveNotice {
-                Text(notice)
-                    .font(.caption.bold())
-                    .padding(8)
-                    .frame(maxWidth: .infinity)
-                    .background(notice.contains("Lỗi") ? Color.red.opacity(0.25) : Color.green.opacity(0.25))
-            }
-
+        Group {
             if node.isTextEditable {
                 TextEditor(text: $textContent)
-                    .font(.system(size: 12.5, design: .monospaced))
+                    .font(.footnote.monospaced())
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
             } else if node.isImageFile {
@@ -3077,7 +3097,7 @@ struct FileDetailEditorView: View {
                                 .resizable()
                                 .scaledToFit()
                                 .frame(maxHeight: 320)
-                                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                                .clipShape(ConcentricRectangle())
                                 .padding(.top, 20)
                             Text("\(Int(img.size.width * img.scale)) × \(Int(img.size.height * img.scale)) px • \(node.formattedSize)")
                                 .font(.caption.monospaced())
@@ -3088,46 +3108,76 @@ struct FileDetailEditorView: View {
                                 if let picked = urls.first {
                                     store.replaceFile(at: node.url, with: picked, relativePath: node.relativePath)
                                     previewImage = UIImage(contentsOfFile: node.url.path)
-                                    saveNotice = "✓ Đã thay ảnh thành công"
+                                    withAnimation(.snappy) {
+                                        saveNotice = "✓ Đã thay ảnh thành công"
+                                    }
                                 }
                             }
                         } label: {
                             Label("Thay ảnh này từ Tệp", systemImage: "photo.badge.arrow.down")
                                 .font(.headline)
                         }
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(.glassProminent)
+                        .controlSize(.large)
                     }
                     .frame(maxWidth: .infinity)
                     .padding()
+                    .containerShape(.rect(cornerRadius: 24))
                 }
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 10) {
                         Text("Tệp nhị phân (\(node.formattedSize)) — 2KB Hex đầu tiên:")
-                            .font(.caption.bold())
+                            .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
                         Text(hexPreview)
-                            .font(.system(size: 11, design: .monospaced))
+                            .font(.caption2.monospaced())
                             .textSelection(.enabled)
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding()
                 }
+            }
+        }
+        .safeAreaInset(edge: .top) {
+            if let notice = saveNotice {
+                let isError = notice.contains("Lỗi")
+                HStack(spacing: 8) {
+                    Text(notice)
+                        .font(.caption.weight(.semibold))
+                    Button {
+                        withAnimation(.snappy) { saveNotice = nil }
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.caption2.weight(.semibold))
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .glassEffect(.regular.tint((isError ? Color.red : Color.green).opacity(0.25)), in: .capsule)
+                .padding(.top, 6)
+                .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
         .navigationTitle(node.name)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItemGroup(placement: .topBarTrailing) {
-                if node.isTextEditable {
+            if node.isTextEditable {
+                ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         store.togglePinForAI(node.relativePath)
                     } label: {
                         Image(systemName: isPinned ? "sparkles.rectangle.stack.fill" : "sparkles")
                             .foregroundStyle(isPinned ? .purple : .primary)
                     }
+                    .accessibilityLabel("Ghim tệp cho AI")
+                }
 
+                ToolbarSpacer(.fixed, placement: .topBarTrailing)
+
+                ToolbarItem(placement: .confirmationAction) {
                     Button("Lưu") { saveFile() }
-                        .fontWeight(.semibold)
                 }
             }
         }
@@ -3174,9 +3224,13 @@ struct FileDetailEditorView: View {
             }
             store.changeLog.insert("✓ Đã sửa thủ công: \(node.relativePath)", at: 0)
             store.refreshWorkspace()
-            saveNotice = "✓ Đã lưu tệp thành công"
+            withAnimation(.snappy) {
+                saveNotice = "✓ Đã lưu tệp thành công"
+            }
         } catch {
-            saveNotice = "Lỗi cú pháp/lưu tệp: \(error.localizedDescription)"
+            withAnimation(.snappy) {
+                saveNotice = "Lỗi cú pháp/lưu tệp: \(error.localizedDescription)"
+            }
         }
     }
 }
@@ -3203,12 +3257,12 @@ struct APISettingsTab: View {
                         VStack(alignment: .leading, spacing: 6) {
                             HStack {
                                 Label(provider.rawValue, systemImage: provider.icon)
-                                    .font(.subheadline.bold())
+                                    .font(.subheadline.weight(.semibold))
                                 Spacer()
                                 if store.selectedProvider == provider {
                                     Text("Đang chọn")
-                                        .font(.caption2.bold())
-                                        .foregroundStyle(.blue)
+                                        .font(.caption2.weight(.semibold))
+                                        .foregroundStyle(.tint)
                                 }
                             }
                             SecureField(
