@@ -12,11 +12,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.tenban.myfirstapp
-        GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
-        INFOPLIST_KEY_UILaunchScreen_Generation: YES
-        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
-        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Info.plist
         MARKETING_VERSION: "3.0"
         CURRENT_PROJECT_VERSION: "30"
         CODE_SIGNING_ALLOWED: "NO"
