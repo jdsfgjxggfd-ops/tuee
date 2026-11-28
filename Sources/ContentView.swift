@@ -4,27 +4,27 @@ import UniformTypeIdentifiers
 import Compression
 import CryptoKit
 
-// MARK: - Native UIKit File Picker & Share Sheet (Fix hoàn toàn lỗi đơ chọn file)
+// MARK: - Native UIKit File Picker & Share Helper
 @MainActor
 final class NativeFilePicker: NSObject, UIDocumentPickerDelegate {
     static let shared = NativeFilePicker()
     private var completion: (([URL]) -> Void)?
 
     static var supportedTypes: [UTType] {
-        var list: [UTType] = [.item, .data, .content, .archive, .zip, .json, .propertyList, .plainText]
-        for ext in ["ipa", "dylib", "deb", "plist", "mobileprovision", "strings", "xml", "cfg"] {
+        var list: [UTType] = [.item, .data, .content, .archive, .zip, .json, .propertyList, .plainText, .image, .png, .jpeg]
+        for ext in ["ipa", "dylib", "deb", "plist", "mobileprovision", "strings", "xml", "cfg", "lua"] {
             if let t = UTType(filenameExtension: ext) { list.append(t) }
         }
         return list
     }
 
-    func pick(allowsMultiple: Bool = false, completion: @escaping ([URL]) -> Void) {
+    func pick(allowsMultiple: Bool = false, types: [UTType]? = nil, completion: @escaping ([URL]) -> Void) {
         guard let presenter = Self.topViewController() else {
             completion([])
             return
         }
         self.completion = completion
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: Self.supportedTypes, asCopy: true)
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: types ?? Self.supportedTypes, asCopy: true)
         picker.delegate = self
         picker.allowsMultipleSelection = allowsMultiple
         picker.shouldShowFileExtensions = true
@@ -71,7 +71,7 @@ enum NativeShareHelper {
     }
 }
 
-// MARK: - Pure Swift ZIP Extractor & Repacker (Compression ZLIB + CRC32)
+// MARK: - Pure Swift ZIP Extractor & Repacker
 enum ZIPArchiveError: LocalizedError {
     case invalidArchive(String)
     case ioFailed(String)
@@ -136,7 +136,7 @@ enum ZIPArchive {
     private static func decompressDeflate(_ data: Data, expectedSize: Int) -> Data? {
         if expectedSize == 0 { return Data() }
         guard !data.isEmpty else { return nil }
-        let dstCapacity = max(expectedSize + 64, 1024)
+        let dstCapacity = max(expectedSize + 1024, 4096)
         var dst = Data(count: dstCapacity)
         let decoded: Int = dst.withUnsafeMutableBytes { dstRaw in
             data.withUnsafeBytes { srcRaw in
@@ -184,7 +184,7 @@ enum ZIPArchive {
         defer { try? handle.close() }
 
         let fileSize = try handle.seekToEnd()
-        guard fileSize >= 22 else { throw ZIPArchiveError.invalidArchive("File quá nhỏ") }
+        guard fileSize >= 22 else { throw ZIPArchiveError.invalidArchive("File quá nhỏ hoặc rỗng") }
 
         let scanLen = Int(min(fileSize, 65557))
         let scanStart = fileSize - UInt64(scanLen)
@@ -208,8 +208,14 @@ enum ZIPArchive {
             throw ZIPArchiveError.invalidArchive("Không tìm thấy cấu trúc ZIP EOCD")
         }
 
-        let cdSize = Int(readU32LE(tail, eocd + 12))
-        let cdOffset = UInt64(readU32LE(tail, eocd + 16))
+        let cdSizeRaw = readU32LE(tail, eocd + 12)
+        let cdOffsetRaw = readU32LE(tail, eocd + 16)
+        guard cdSizeRaw != 0xFFFFFFFF && cdOffsetRaw != 0xFFFFFFFF else {
+            throw ZIPArchiveError.invalidArchive("Chưa hỗ trợ gói ZIP64 vượt quá 4GB")
+        }
+
+        let cdSize = Int(cdSizeRaw)
+        let cdOffset = UInt64(cdOffsetRaw)
         try handle.seek(toOffset: cdOffset)
         guard let cdData = try handle.read(upToCount: cdSize), cdData.count == cdSize else {
             throw ZIPArchiveError.invalidArchive("Central Directory bị hỏng")
@@ -246,12 +252,14 @@ enum ZIPArchive {
         let total = max(entries.count, 1)
         for (idx, entry) in entries.enumerated() {
             try autoreleasepool {
-                if idx % 20 == 0 || idx == entries.count - 1 {
+                if idx % 25 == 0 || idx == entries.count - 1 {
                     onProgress?(Double(idx + 1) / Double(total), entry.name)
                 }
-                guard !entry.name.isEmpty, !entry.name.contains("..") else { return }
-                let outURL = destinationDir.appendingPathComponent(entry.name)
+                guard !entry.name.isEmpty,
+                      !entry.name.contains(".."),
+                      !entry.name.hasPrefix("__MACOSX/") else { return }
 
+                let outURL = destinationDir.appendingPathComponent(entry.name)
                 if entry.name.hasSuffix("/") {
                     try fm.createDirectory(at: outURL, withIntermediateDirectories: true)
                     return
@@ -264,12 +272,9 @@ enum ZIPArchive {
                 let localExtraLen = Int(readU16LE(localHeader, 28))
                 try handle.seek(toOffset: UInt64(entry.localOffset) + 30 + UInt64(localNameLen + localExtraLen))
 
-                let rawData: Data
-                if entry.compressedSize == 0 {
-                    rawData = Data()
-                } else {
-                    rawData = (try handle.read(upToCount: Int(entry.compressedSize))) ?? Data()
-                }
+                let rawData: Data = entry.compressedSize == 0
+                    ? Data()
+                    : ((try handle.read(upToCount: Int(entry.compressedSize))) ?? Data())
 
                 let finalData: Data
                 if entry.method == 0 {
@@ -280,11 +285,10 @@ enum ZIPArchive {
                     }
                     finalData = decoded
                 } else {
-                    throw ZIPArchiveError.invalidArchive("Phương thức nén \(entry.method) chưa hỗ trợ")
+                    throw ZIPArchiveError.invalidArchive("Phương thức nén \(entry.method) không hỗ trợ")
                 }
 
                 try finalData.write(to: outURL, options: .atomic)
-
                 let unixMode = (entry.externalAttr >> 16) & 0xFFFF
                 if (unixMode & 0o111) != 0 {
                     try? fm.setAttributes([.posixPermissions: Int(unixMode & 0o777)], ofItemAtPath: outURL.path)
@@ -313,7 +317,7 @@ enum ZIPArchive {
         let outHandle = try FileHandle(forWritingTo: outputIPA)
         defer { try? outHandle.close() }
 
-        guard let enumerator = fm.enumerator(at: sourceDir, includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey]) else {
+        guard let enumerator = fm.enumerator(at: sourceDir, includingPropertiesForKeys: [.isDirectoryKey]) else {
             throw ZIPArchiveError.ioFailed("Không duyệt được thư mục làm việc")
         }
 
@@ -326,18 +330,18 @@ enum ZIPArchive {
 
         for (idx, itemURL) in allURLs.enumerated() {
             try autoreleasepool {
+                if itemURL.lastPathComponent == ".DS_Store" { return }
                 let fullPath = itemURL.standardizedFileURL.path
                 guard fullPath.hasPrefix(rootPath) else { return }
                 var relPath = String(fullPath.dropFirst(rootPath.count))
                 if relPath.hasPrefix("/") { relPath.removeFirst() }
                 guard !relPath.isEmpty else { return }
 
-                if idx % 20 == 0 || idx == allURLs.count - 1 {
+                if idx % 25 == 0 || idx == allURLs.count - 1 {
                     onProgress?(Double(idx + 1) / Double(total), relPath)
                 }
 
-                let values = try itemURL.resourceValues(forKeys: [.isDirectoryKey])
-                let isDir = values.isDirectory ?? false
+                let isDir = (try? itemURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
                 let entryName = isDir ? (relPath.hasSuffix("/") ? relPath : relPath + "/") : relPath
                 let nameData = Data(entryName.utf8)
 
@@ -352,7 +356,6 @@ enum ZIPArchive {
                     uncompSize = UInt32(fileData.count)
                     crcVal = crc32(fileData)
 
-                    // Giữ quyền thực thi cho file Mach-O & dylib
                     let perms = (try? fm.attributesOfItem(atPath: itemURL.path)[.posixPermissions] as? Int) ?? 0o644
                     let isMachO = fileData.count >= 4 && (
                         (fileData[0] == 0xCF && fileData[1] == 0xFA && fileData[2] == 0xED && fileData[3] == 0xFE) ||
@@ -377,7 +380,7 @@ enum ZIPArchive {
                 var lfh = Data(capacity: 30 + nameData.count)
                 appendU32LE(&lfh, 0x04034B50)
                 appendU16LE(&lfh, 20)
-                appendU16LE(&lfh, 0x0800) // UTF-8
+                appendU16LE(&lfh, 0x0800)
                 appendU16LE(&lfh, method)
                 appendU16LE(&lfh, 0x0000)
                 appendU16LE(&lfh, 0x5821)
@@ -411,7 +414,7 @@ enum ZIPArchive {
         for item in written {
             var cdh = Data(capacity: 46 + item.nameData.count)
             appendU32LE(&cdh, 0x02014B50)
-            appendU16LE(&cdh, 0x031E) // UNIX
+            appendU16LE(&cdh, 0x031E)
             appendU16LE(&cdh, 20)
             appendU16LE(&cdh, 0x0800)
             appendU16LE(&cdh, item.method)
@@ -445,7 +448,7 @@ enum ZIPArchive {
     }
 }
 
-// MARK: - Deep Mach-O Binary Inspector
+// MARK: - Mach-O Binary Deep Inspector
 struct MachOInfo: Sendable {
     let executableName: String
     let fileSizeBytes: Int64
@@ -462,12 +465,12 @@ struct MachOInfo: Sendable {
 enum MachOInspector {
     private static func readU32LE(_ d: Data, _ off: Int) -> UInt32 {
         let b = d.startIndex + off
-        return UInt32(d[b]) | (UInt32(d[b+1]) << 8) | (UInt32(d[b+2]) << 16) | (UInt32(d[b+3]) << 24)
+        return UInt32(d[b]) | (UInt32(d[b + 1]) << 8) | (UInt32(d[b + 2]) << 16) | (UInt32(d[b + 3]) << 24)
     }
 
     private static func readU32BE(_ d: Data, _ off: Int) -> UInt32 {
         let b = d.startIndex + off
-        return (UInt32(d[b]) << 24) | (UInt32(d[b+1]) << 16) | (UInt32(d[b+2]) << 8) | UInt32(d[b+3])
+        return (UInt32(d[b]) << 24) | (UInt32(d[b + 1]) << 16) | (UInt32(d[b + 2]) << 8) | UInt32(d[b + 3])
     }
 
     private static func decodeVersion(_ raw: UInt32) -> String {
@@ -541,40 +544,37 @@ enum MachOInspector {
             let cmdsize = Int(readU32LE(cmdData, pos + 4))
             guard cmdsize >= 8, pos + cmdsize <= cmdData.count else { break }
 
-            if cmd == 0x2C || cmd == 0x21 { // LC_ENCRYPTION_INFO_64 / LC_ENCRYPTION_INFO
+            if cmd == 0x2C || cmd == 0x21 {
                 if pos + 20 <= cmdData.count {
                     cryptID = readU32LE(cmdData, pos + 16)
                 }
-            } else if cmd == 0x32 { // LC_BUILD_VERSION
+            } else if cmd == 0x32 {
                 if pos + 20 <= cmdData.count {
                     minOS = decodeVersion(readU32LE(cmdData, pos + 12))
                     sdk = decodeVersion(readU32LE(cmdData, pos + 16))
                 }
-            } else if cmd == 0x0C || cmd == 0x80000018 || cmd == 0x8000001F || cmd == 0x20 { // Dylibs
+            } else if cmd == 0x0C || cmd == 0x80000018 || cmd == 0x8000001F || cmd == 0x20 {
                 if pos + 12 <= cmdData.count {
                     let strOff = Int(readU32LE(cmdData, pos + 8))
                     if strOff < cmdsize {
                         let start = cmdData.startIndex + pos + strOff
                         let end = cmdData.startIndex + pos + cmdsize
                         let slice = cmdData[start..<end]
-                        if let nullIdx = slice.firstIndex(of: 0) {
-                            if let s = String(data: slice[start..<nullIdx], encoding: .utf8), !s.isEmpty {
-                                dylibs.append(s)
-                            }
-                        } else if let s = String(data: slice, encoding: .utf8), !s.isEmpty {
-                            dylibs.append(s.trimmingCharacters(in: .controlCharacters))
+                        let stop = slice.firstIndex(of: 0) ?? end
+                        if let s = String(data: slice[start..<stop], encoding: .utf8), !s.isEmpty {
+                            dylibs.append(s)
                         }
                     }
                 }
-            } else if cmd == 0x8000001C { // LC_RPATH
+            } else if cmd == 0x8000001C {
                 if pos + 12 <= cmdData.count {
                     let strOff = Int(readU32LE(cmdData, pos + 8))
                     if strOff < cmdsize {
                         let start = cmdData.startIndex + pos + strOff
                         let end = cmdData.startIndex + pos + cmdsize
                         let slice = cmdData[start..<end]
-                        let endPos = slice.firstIndex(of: 0) ?? end
-                        if let s = String(data: slice[start..<endPos], encoding: .utf8), !s.isEmpty {
+                        let stop = slice.firstIndex(of: 0) ?? end
+                        if let s = String(data: slice[start..<stop], encoding: .utf8), !s.isEmpty {
                             rpaths.append(s)
                         }
                     }
@@ -668,6 +668,29 @@ struct IPAFileNode: Identifiable, Hashable, Sendable {
         let ext = url.pathExtension.lowercased()
         return ["plist", "json", "txt", "xml", "strings", "entitlements", "cfg", "ini", "lua", "js", "html", "css", "md", "yaml", "yml"].contains(ext)
     }
+
+    var isImageFile: Bool {
+        let ext = url.pathExtension.lowercased()
+        return ["png", "jpg", "jpeg", "webp", "gif"].contains(ext)
+    }
+
+    var iconName: String {
+        if isDirectory { return "folder.fill" }
+        if isImageFile { return "photo.fill" }
+        if isTextEditable { return "doc.text.fill" }
+        let ext = url.pathExtension.lowercased()
+        if ext == "dylib" || ext == "framework" { return "puzzlepiece.extension.fill" }
+        return "doc.fill"
+    }
+
+    var iconColor: Color {
+        if isDirectory { return .blue }
+        if isImageFile { return .orange }
+        if isTextEditable { return .green }
+        let ext = url.pathExtension.lowercased()
+        if ext == "dylib" || ext == "framework" { return .purple }
+        return .secondary
+    }
 }
 
 struct IPAWorkspaceSummary: Sendable {
@@ -696,15 +719,15 @@ struct IPAWorkspaceSummary: Sendable {
     let iconPath: URL?
 }
 
-// MARK: - AI Providers & Multi-API Engine
+// MARK: - AI Providers & Streaming SSE Engine
 enum AIProvider: String, CaseIterable, Identifiable, Codable, Sendable {
     case gemini = "Google Gemini"
-    case openai = "OpenAI (ChatGPT)"
+    case openai = "OpenAI"
     case claude = "Anthropic Claude"
     case deepseek = "DeepSeek"
     case groq = "Groq"
     case grok = "xAI Grok"
-    case openrouter = "OpenRouter (All-in-One)"
+    case openrouter = "OpenRouter"
     case custom = "Custom OpenAI API"
 
     var id: String { rawValue }
@@ -738,21 +761,21 @@ enum AIProvider: String, CaseIterable, Identifiable, Codable, Sendable {
     var presetModels: [String] {
         switch self {
         case .gemini:
-            return ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-thinking-exp"]
+            return ["gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-3.8-pro"]
         case .openai:
-            return ["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "o4-mini", "o3-mini"]
+            return ["gpt-4.1-mini", "gpt-4.1", "gpt-4o", "o4-mini"]
         case .claude:
-            return ["claude-sonnet-4-20250514", "claude-3-7-sonnet-latest", "claude-3-5-haiku-latest"]
+            return ["claude-sonnet-4-20250514", "claude-3-5-haiku-latest"]
         case .deepseek:
-            return ["deepseek-reasoner", "deepseek-chat"]
+            return ["deepseek-chat", "deepseek-reasoner"]
         case .groq:
-            return ["llama-3.3-70b-versatile", "qwen-qwq-32b", "deepseek-r1-distill-llama-70b"]
+            return ["llama-3.3-70b-versatile", "qwen-qwq-32b"]
         case .grok:
-            return ["grok-3", "grok-3-mini", "grok-2-latest"]
+            return ["grok-3-mini", "grok-3"]
         case .openrouter:
-            return ["google/gemini-2.5-pro", "anthropic/claude-sonnet-4", "openai/gpt-4.1", "deepseek/deepseek-r1"]
+            return ["google/gemini-3.8-flash", "anthropic/claude-sonnet-4", "openai/gpt-4.1", "deepseek/deepseek-chat"]
         case .custom:
-            return ["gpt-4o", "gemini-2.5-pro", "claude-sonnet-4"]
+            return ["gemini-3.8-flash", "gpt-4o", "claude-sonnet-4"]
         }
     }
 
@@ -768,6 +791,13 @@ enum AIProvider: String, CaseIterable, Identifiable, Codable, Sendable {
         case .custom: return "Bearer API Key..."
         }
     }
+}
+
+enum AIContextDepth: String, CaseIterable, Identifiable {
+    case fast = "Nhanh"
+    case deep = "Sâu"
+
+    var id: String { rawValue }
 }
 
 struct AIPatchAction: Codable, Identifiable, Sendable {
@@ -810,11 +840,11 @@ struct AIPatchEnvelope: Codable, Sendable {
 struct AIMessage: Identifiable, Sendable {
     let id = UUID()
     let isUser: Bool
-    let text: String
+    var text: String
     let modelBadge: String?
-    let patch: AIPatchEnvelope?
+    var patch: AIPatchEnvelope?
     var patchApplied: Bool = false
-    let timestamp = Date()
+    var isStreaming: Bool = false
 }
 
 struct AIChatTurn: Sendable {
@@ -823,106 +853,144 @@ struct AIChatTurn: Sendable {
 }
 
 enum AIClient {
-    static func send(
+    static func stream(
         provider: AIProvider,
         model: String,
         apiKey: String,
         customEndpoint: String,
         systemPrompt: String,
-        history: [AIChatTurn]
+        history: [AIChatTurn],
+        onChunk: @escaping @Sendable (String) async -> Void
     ) async throws -> String {
         let cleanKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanKey.isEmpty else {
-            throw NSError(domain: "AIClient", code: 401, userInfo: [NSLocalizedDescriptionKey: "Bạn chưa nhập API Key cho \(provider.rawValue). Bấm nút chọn Model ở góc trên để thêm key."])
+            throw NSError(domain: "AIClient", code: 401, userInfo: [NSLocalizedDescriptionKey: "Chưa có API Key cho \(provider.rawValue). Bấm nút Model ở góc trên để dán key."])
         }
 
         switch provider {
         case .gemini:
-            return try await callGemini(model: model, apiKey: cleanKey, systemPrompt: systemPrompt, history: history)
+            return try await streamGemini(model: model, apiKey: cleanKey, systemPrompt: systemPrompt, history: history, onChunk: onChunk)
         case .claude:
-            return try await callClaude(model: model, apiKey: cleanKey, systemPrompt: systemPrompt, history: history)
+            return try await streamClaude(model: model, apiKey: cleanKey, systemPrompt: systemPrompt, history: history, onChunk: onChunk)
         case .openai, .deepseek, .groq, .grok, .openrouter, .custom:
-            let endpoint = (provider == .custom && !customEndpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                ? customEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
-                : provider.defaultEndpoint
-            return try await callOpenAICompatible(endpoint: endpoint, model: model, apiKey: cleanKey, systemPrompt: systemPrompt, history: history)
+            let customClean = customEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+            let endpoint = (provider == .custom && !customClean.isEmpty) ? customClean : provider.defaultEndpoint
+            return try await streamOpenAI(endpoint: endpoint, model: model, apiKey: cleanKey, systemPrompt: systemPrompt, history: history, onChunk: onChunk)
         }
     }
 
-    private static func callGemini(model: String, apiKey: String, systemPrompt: String, history: [AIChatTurn]) async throws -> String {
+    private static func streamGemini(
+        model: String,
+        apiKey: String,
+        systemPrompt: String,
+        history: [AIChatTurn],
+        onChunk: @escaping @Sendable (String) async -> Void
+    ) async throws -> String {
         let encodedModel = model.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? model
-        guard let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(encodedModel):generateContent?key=\(apiKey)") else {
+        guard let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(encodedModel):streamGenerateContent?alt=sse&key=\(apiKey)") else {
             throw NSError(domain: "AIClient", code: 400, userInfo: [NSLocalizedDescriptionKey: "Tên model Gemini không hợp lệ."])
         }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.timeoutInterval = 90
+        req.timeoutInterval = 120
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
         let contents: [[String: Any]] = history.map { turn in
-            [
-                "role": turn.isUser ? "user" : "model",
-                "parts": [["text": turn.text]]
-            ]
+            ["role": turn.isUser ? "user" : "model", "parts": [["text": turn.text]]]
         }
         let body: [String: Any] = [
             "system_instruction": ["parts": [["text": systemPrompt]]],
             "contents": contents,
-            "generationConfig": ["temperature": 0.25]
+            "generationConfig": ["temperature": 0.2]
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await URLSession.shared.data(for: req)
-        try validateHTTP(response: response, data: data)
-        if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let candidates = json["candidates"] as? [[String: Any]],
-           let content = candidates.first?["content"] as? [String: Any],
-           let parts = content["parts"] as? [[String: Any]] {
-            let texts = parts.compactMap { $0["text"] as? String }
-            if !texts.isEmpty { return texts.joined(separator: "\n") }
+        let (bytes, response) = try await URLSession.shared.bytes(for: req)
+        try await validateStreamHTTP(response: response, bytes: bytes)
+
+        var accumulated = ""
+        for try await line in bytes.lines {
+            if Task.isCancelled { break }
+            guard line.hasPrefix("data:") else { continue }
+            let jsonStr = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+            guard !jsonStr.isEmpty, jsonStr != "[DONE]",
+                  let data = jsonStr.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let candidates = json["candidates"] as? [[String: Any]],
+                  let content = candidates.first?["content"] as? [String: Any],
+                  let parts = content["parts"] as? [[String: Any]] else { continue }
+
+            for part in parts {
+                if (part["thought"] as? Bool) == true { continue }
+                if let piece = part["text"] as? String, !piece.isEmpty {
+                    accumulated += piece
+                    await onChunk(piece)
+                }
+            }
         }
-        throw NSError(domain: "AIClient", code: 500, userInfo: [NSLocalizedDescriptionKey: "Gemini không trả về nội dung."])
+        return accumulated
     }
 
-    private static func callClaude(model: String, apiKey: String, systemPrompt: String, history: [AIChatTurn]) async throws -> String {
+    private static func streamClaude(
+        model: String,
+        apiKey: String,
+        systemPrompt: String,
+        history: [AIChatTurn],
+        onChunk: @escaping @Sendable (String) async -> Void
+    ) async throws -> String {
         guard let url = URL(string: AIProvider.claude.defaultEndpoint) else {
-            throw NSError(domain: "AIClient", code: 400, userInfo: [NSLocalizedDescriptionKey: "URL Claude lỗi."])
+            throw NSError(domain: "AIClient", code: 400, userInfo: [NSLocalizedDescriptionKey: "URL Claude không hợp lệ."])
         }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.timeoutInterval = 90
+        req.timeoutInterval = 120
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
         req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
 
-        let messages: [[String: Any]] = history.map { turn in
-            ["role": turn.isUser ? "user" : "assistant", "content": turn.text]
-        }
+        let messages: [[String: Any]] = history.map { ["role": $0.isUser ? "user" : "assistant", "content": $0.text] }
         let body: [String: Any] = [
             "model": model,
             "max_tokens": 4096,
+            "stream": true,
             "system": systemPrompt,
             "messages": messages
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await URLSession.shared.data(for: req)
-        try validateHTTP(response: response, data: data)
-        if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let content = json["content"] as? [[String: Any]] {
-            let texts = content.compactMap { $0["text"] as? String }
-            if !texts.isEmpty { return texts.joined(separator: "\n") }
+        let (bytes, response) = try await URLSession.shared.bytes(for: req)
+        try await validateStreamHTTP(response: response, bytes: bytes)
+
+        var accumulated = ""
+        for try await line in bytes.lines {
+            if Task.isCancelled { break }
+            guard line.hasPrefix("data:") else { continue }
+            let jsonStr = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+            guard let data = jsonStr.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  (json["type"] as? String) == "content_block_delta",
+                  let delta = json["delta"] as? [String: Any],
+                  let piece = delta["text"] as? String, !piece.isEmpty else { continue }
+            accumulated += piece
+            await onChunk(piece)
         }
-        throw NSError(domain: "AIClient", code: 500, userInfo: [NSLocalizedDescriptionKey: "Claude không trả về nội dung."])
+        return accumulated
     }
 
-    private static func callOpenAICompatible(endpoint: String, model: String, apiKey: String, systemPrompt: String, history: [AIChatTurn]) async throws -> String {
+    private static func streamOpenAI(
+        endpoint: String,
+        model: String,
+        apiKey: String,
+        systemPrompt: String,
+        history: [AIChatTurn],
+        onChunk: @escaping @Sendable (String) async -> Void
+    ) async throws -> String {
         guard let url = URL(string: endpoint) else {
             throw NSError(domain: "AIClient", code: 400, userInfo: [NSLocalizedDescriptionKey: "Endpoint API không hợp lệ."])
         }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.timeoutInterval = 90
+        req.timeoutInterval = 120
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
 
@@ -932,29 +1000,40 @@ enum AIClient {
         }
         let body: [String: Any] = [
             "model": model,
+            "stream": true,
             "messages": messages,
-            "temperature": 0.25
+            "temperature": 0.2
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await URLSession.shared.data(for: req)
-        try validateHTTP(response: response, data: data)
-        if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let choices = json["choices"] as? [[String: Any]],
-           let msg = choices.first?["message"] as? [String: Any],
-           let text = msg["content"] as? String {
-            return text
+        let (bytes, response) = try await URLSession.shared.bytes(for: req)
+        try await validateStreamHTTP(response: response, bytes: bytes)
+
+        var accumulated = ""
+        for try await line in bytes.lines {
+            if Task.isCancelled { break }
+            guard line.hasPrefix("data:") else { continue }
+            let jsonStr = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+            guard !jsonStr.isEmpty, jsonStr != "[DONE]",
+                  let data = jsonStr.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let choices = json["choices"] as? [[String: Any]],
+                  let delta = choices.first?["delta"] as? [String: Any],
+                  let piece = delta["content"] as? String, !piece.isEmpty else { continue }
+            accumulated += piece
+            await onChunk(piece)
         }
-        throw NSError(domain: "AIClient", code: 500, userInfo: [NSLocalizedDescriptionKey: "API không trả về nội dung."])
+        return accumulated
     }
 
-    private static func validateHTTP(response: URLResponse, data: Data) throws {
-        guard let http = response as? HTTPURLResponse else { return }
-        guard (200...299).contains(http.statusCode) else {
-            let bodyText = String(data: data, encoding: .utf8) ?? ""
-            let preview = String(bodyText.prefix(260))
-            throw NSError(domain: "AIClient", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "Lỗi API (\(http.statusCode)): \(preview)"])
+    private static func validateStreamHTTP(response: URLResponse, bytes: URLSession.AsyncBytes) async throws {
+        guard let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) else { return }
+        var errText = ""
+        for try await line in bytes.lines {
+            errText += line
+            if errText.count > 360 { break }
         }
+        throw NSError(domain: "AIClient", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "Lỗi API (\(http.statusCode)): \(errText)"])
     }
 }
 
@@ -1101,7 +1180,7 @@ enum AIPatchEngine {
     }
 }
 
-// MARK: - Main Studio Store Manager
+// MARK: - Studio Store Manager
 @MainActor
 final class IPAStudioManager: ObservableObject {
     @Published var summary: IPAWorkspaceSummary?
@@ -1113,12 +1192,15 @@ final class IPAStudioManager: ObservableObject {
     @Published var changeLog: [String] = []
     @Published var pinnedFilesForAI: [String] = []
 
-    // AI State
+    // AI Config
     @Published var selectedProvider: AIProvider = .gemini {
         didSet { UserDefaults.standard.set(selectedProvider.rawValue, forKey: providerKey) }
     }
-    @Published var selectedModel: String = "gemini-2.5-pro" {
+    @Published var selectedModel: String = "gemini-3.8-flash" {
         didSet { UserDefaults.standard.set(selectedModel, forKey: modelKey) }
+    }
+    @Published var contextDepth: AIContextDepth = .fast {
+        didSet { UserDefaults.standard.set(contextDepth.rawValue, forKey: depthKey) }
     }
     @Published var apiKeys: [String: String] = [:] {
         didSet { UserDefaults.standard.set(apiKeys, forKey: keysStorageKey) }
@@ -1132,8 +1214,11 @@ final class IPAStudioManager: ObservableObject {
     @Published var messages: [AIMessage] = []
     @Published var isAIThinking = false
 
-    private let providerKey = "IPAStudio_Provider"
-    private let modelKey = "IPAStudio_Model"
+    private var aiStreamTask: Task<Void, Never>?
+
+    private let providerKey = "IPAStudio_v4_Provider"
+    private let modelKey = "IPAStudio_v4_Model"
+    private let depthKey = "IPAStudio_v4_Depth"
     private let keysStorageKey = "IPAStudio_APIKeys"
     private let customEndpointKey = "IPAStudio_CustomEndpoint"
     private let compressKey = "IPAStudio_Compress"
@@ -1164,6 +1249,10 @@ final class IPAStudioManager: ObservableObject {
         if let savedM = UserDefaults.standard.string(forKey: modelKey), !savedM.isEmpty {
             selectedModel = savedM
         }
+        if let rawD = UserDefaults.standard.string(forKey: depthKey),
+           let parsedD = AIContextDepth(rawValue: rawD) {
+            contextDepth = parsedD
+        }
         if let savedKeys = UserDefaults.standard.dictionary(forKey: keysStorageKey) as? [String: String] {
             apiKeys = savedKeys
         }
@@ -1174,7 +1263,7 @@ final class IPAStudioManager: ObservableObject {
         messages = [
             AIMessage(
                 isUser: false,
-                text: "Nhập một file `.ipa` ở tab **IPA**, rồi quay lại đây ra lệnh cho tôi soi sâu `Info.plist`, kiểm tra mã hóa FairPlay, soi Dylib/Tweak hoặc tự động chỉnh sửa mọi thứ bên trong gói IPA.",
+                text: "Nhập file `.ipa` ở tab **IPA**, chọn model AI ở góc trên rồi ra lệnh soi sâu hoặc tự động chỉnh sửa gói IPA.",
                 modelBadge: nil,
                 patch: nil
             )
@@ -1192,7 +1281,7 @@ final class IPAStudioManager: ObservableObject {
         }
     }
 
-    // MARK: - Import & Extract IPA
+    // MARK: - Import & Analyze IPA
     func importIPA(from pickedURL: URL) {
         let ext = pickedURL.pathExtension.lowercased()
         guard ext == "ipa" || ext == "zip" else {
@@ -1229,7 +1318,7 @@ final class IPAStudioManager: ObservableObject {
 
                 self.summary = analyzed
                 self.pinnedFilesForAI = []
-                self.changeLog = ["Đã nhập & giải nén: \(sourceName)"]
+                self.changeLog = ["Đã mở gói: \(sourceName)"]
                 self.isBusy = false
                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()
             } catch {
@@ -1306,7 +1395,6 @@ final class IPAStudioManager: ObservableObject {
         let machO = MachOInspector.inspect(binaryURL: execURL)
         let provSummary = PlistHelper.parseEmbeddedProvisionSummary(appBundleURL: appBundle)
 
-        // Tìm ảnh icon (ưu tiên png lớn nhất có chữ AppIcon)
         let appItems = (try? fm.contentsOfDirectory(at: appBundle, includingPropertiesForKeys: [.fileSizeKey])) ?? []
         let iconURL = appItems
             .filter { $0.pathExtension.lowercased() == "png" && $0.lastPathComponent.lowercased().contains("icon") }
@@ -1344,7 +1432,7 @@ final class IPAStudioManager: ObservableObject {
         )
     }
 
-    // MARK: - Quick Native Edits
+    // MARK: - Quick Edits & Cleanup
     func applyManualEdits(name: String, bundleID: String, version: String, minOS: String, fileSharing: Bool, removeDeviceLimit: Bool) {
         guard let sum = summary, var dict = PlistHelper.readDict(url: sum.infoPlistURL) else { return }
         dict["CFBundleDisplayName"] = name
@@ -1372,13 +1460,36 @@ final class IPAStudioManager: ObservableObject {
         if FileManager.default.fileExists(atPath: target.path) {
             do {
                 try FileManager.default.removeItem(at: target)
-                changeLog.insert("✓ Đã xóa thư mục \(folderName)", at: 0)
+                changeLog.insert("✓ Đã xóa \(folderName)", at: 0)
                 refreshWorkspace()
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
             } catch {
                 alertMessage = "Không xóa được \(folderName): \(error.localizedDescription)"
             }
         }
+    }
+
+    func cleanAllForSideload() {
+        guard let sum = summary else { return }
+        let fm = FileManager.default
+        var removed: [String] = []
+        for dir in ["PlugIns", "Watch", "_CodeSignature"] {
+            let target = sum.appBundleURL.appendingPathComponent(dir)
+            if fm.fileExists(atPath: target.path) {
+                try? fm.removeItem(at: target)
+                removed.append(dir)
+            }
+        }
+        if var dict = PlistHelper.readDict(url: sum.infoPlistURL) {
+            dict["UIFileSharingEnabled"] = true
+            dict["LSSupportsOpeningDocumentsInPlace"] = true
+            dict.removeValue(forKey: "UISupportedDevices")
+            try? PlistHelper.writeDict(dict, to: sum.infoPlistURL)
+        }
+        let note = removed.isEmpty ? "Đã bật FileSharing & gỡ giới hạn thiết bị" : "Đã xóa \(removed.joined(separator: ", ")) & tối ưu Info.plist"
+        changeLog.insert("✓ \(note)", at: 0)
+        refreshWorkspace()
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
     }
 
     func exportEditedIPA() {
@@ -1405,7 +1516,7 @@ final class IPAStudioManager: ObservableObject {
                 }.value
 
                 self.isBusy = false
-                self.changeLog.insert("✓ Đã xuất IPA: \(outURL.lastPathComponent)", at: 0)
+                self.changeLog.insert("✓ Đã xuất: \(outURL.lastPathComponent)", at: 0)
                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                 NativeShareHelper.share(url: outURL)
             } catch {
@@ -1459,6 +1570,18 @@ final class IPAStudioManager: ObservableObject {
         }
     }
 
+    func replaceFile(at targetURL: URL, with sourceURL: URL, relativePath: String) {
+        do {
+            let data = try Data(contentsOf: sourceURL)
+            try data.write(to: targetURL, options: .atomic)
+            changeLog.insert("✓ Đã thay tệp: \(relativePath)", at: 0)
+            refreshWorkspace()
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        } catch {
+            alertMessage = "Lỗi thay tệp: \(error.localizedDescription)"
+        }
+    }
+
     func togglePinForAI(_ relativePath: String) {
         if let idx = pinnedFilesForAI.firstIndex(of: relativePath) {
             pinnedFilesForAI.remove(at: idx)
@@ -1467,93 +1590,78 @@ final class IPAStudioManager: ObservableObject {
         }
     }
 
-    // MARK: - AI Context Builder & Chat
-    private func buildDeepIPAContext() -> String {
+    // MARK: - Smart Compact / Deep AI Context
+    private func buildIPAContext() -> String {
         guard let sum = summary else {
             return "Hiện người dùng CHƯA nhập file IPA nào."
         }
         var lines: [String] = []
-        lines.append("=== THÔNG TIN IPA ĐANG MỞ ===")
+        lines.append("=== IPA ĐANG MỞ ===")
         lines.append("File: \(sum.sourceFileName) (\(ByteCountFormatter.string(fromByteCount: sum.originalIPASize, countStyle: .file)))")
-        lines.append("Tên app: \(sum.displayName) | Bundle ID: \(sum.bundleID) | Version: \(sum.version) (\(sum.buildNumber)) | MinOS: \(sum.minOS)")
-        lines.append("Executable: \(sum.executableName) | Tổng số tệp trong .app: \(sum.totalFilesCount)")
-        lines.append("FileSharing: \(sum.fileSharingEnabled) | UISupportedDevices: \(sum.hasSupportedDevicesLimit) | _CodeSignature: \(sum.hasCodeSignature)")
-        lines.append("PlugIns (\(sum.pluginNames.count)): \(sum.pluginNames.joined(separator: ", "))")
-        lines.append("Frameworks (\(sum.frameworkNames.count)): \(sum.frameworkNames.prefix(40).joined(separator: ", "))")
-        if let prov = sum.provisionSummary {
-            lines.append("embedded.mobileprovision: \(prov)")
-        }
+        lines.append("Name: \(sum.displayName) | BundleID: \(sum.bundleID) | Ver: \(sum.version) (\(sum.buildNumber)) | MinOS: \(sum.minOS)")
+        lines.append("Exec: \(sum.executableName) | Files: \(sum.totalFilesCount) | FileSharing: \(sum.fileSharingEnabled) | DeviceLimit: \(sum.hasSupportedDevicesLimit) | CodeSig: \(sum.hasCodeSignature)")
+        if !sum.pluginNames.isEmpty { lines.append("PlugIns: \(sum.pluginNames.joined(separator: ", "))") }
+        if !sum.frameworkNames.isEmpty { lines.append("Frameworks (\(sum.frameworkNames.count)): \(sum.frameworkNames.prefix(30).joined(separator: ", "))") }
+        if let prov = sum.provisionSummary { lines.append("Provision: \(prov)") }
 
         if let m = sum.machO {
-            let enc = m.isEncrypted == nil ? "Không có LC_ENCRYPTION_INFO" : (m.isEncrypted == true ? "ĐANG MÃ HÓA FAIRPLAY (cryptid=\(m.cryptID ?? 1))" : "ĐÃ GIẢI MÃ (cryptid=0)")
-            lines.append("\n=== PHÂN TÍCH MACH-O BINARY ===")
-            lines.append("Kiến trúc: \(m.architectures.joined(separator: ", ")) | Trạng thái mã hóa: \(enc)")
-            lines.append("MinOS (LC_BUILD_VERSION): \(m.minOSVersion ?? "N/A") | SDK: \(m.sdkVersion ?? "N/A")")
-            lines.append("Dylib/Tweak tùy chỉnh/nhúng (\(m.injectedDylibs.count)): \(m.injectedDylibs.joined(separator: ", "))")
-            lines.append("Tổng số Dylib hệ thống liên kết: \(m.linkedDylibs.count)")
+            let enc = m.isEncrypted == nil ? "None" : (m.isEncrypted == true ? "ENCRYPTED(cryptid=\(m.cryptID ?? 1))" : "Decrypted(0)")
+            lines.append("Mach-O: arch=\(m.architectures.joined(separator: ",")) | FairPlay=\(enc) | SDK=\(m.sdkVersion ?? "N/A") | InjectedDylibs=\(m.injectedDylibs.joined(separator: ", "))")
         }
 
-        // Top-level files trong .app
-        let topNodes = listDirectory(sum.appBundleURL).prefix(60)
-        lines.append("\n=== CÂY THƯ MỤC GỐC .APP ===")
-        for n in topNodes {
-            lines.append("- \(n.name) (\(n.formattedSize))")
+        if contextDepth == .deep {
+            let topNodes = listDirectory(sum.appBundleURL).prefix(50)
+            lines.append("\n=== TỆP GỐC .APP ===")
+            for n in topNodes { lines.append("- \(n.name) (\(n.formattedSize))") }
+
+            if let xml = PlistHelper.plistToXMLString(url: sum.infoPlistURL) {
+                lines.append("\n=== INFO.PLIST (XML) ===")
+                lines.append(String(xml.prefix(9000)))
+            }
         }
 
-        // Info.plist XML (giới hạn 12KB để tiết kiệm token)
-        if let xml = PlistHelper.plistToXMLString(url: sum.infoPlistURL) {
-            lines.append("\n=== NỘI DUNG INFO.PLIST (XML) ===")
-            lines.append(String(xml.prefix(12000)))
-        }
-
-        // Các file người dùng ghim thêm để AI soi kỹ
         if !pinnedFilesForAI.isEmpty {
-            lines.append("\n=== CÁC TỆP NGƯỜI DÙNG GHIM ĐỂ SOI SÂU ===")
-            for rel in pinnedFilesForAI.prefix(5) {
+            lines.append("\n=== TỆP GHIM ===")
+            for rel in pinnedFilesForAI.prefix(4) {
                 let fileURL = sum.appBundleURL.appendingPathComponent(rel)
                 let content: String
                 if fileURL.pathExtension.lowercased() == "plist", let xml = PlistHelper.plistToXMLString(url: fileURL) {
                     content = xml
                 } else {
-                    content = (try? String(contentsOf: fileURL, encoding: .utf8)) ?? "(Tệp nhị phân)"
+                    content = (try? String(contentsOf: fileURL, encoding: .utf8)) ?? "(Binary)"
                 }
-                lines.append("--- FILE: \(rel) ---\n\(String(content.prefix(6000)))")
+                lines.append("--- \(rel) ---\n\(String(content.prefix(4500)))")
             }
         }
-
         return lines.joined(separator: "\n")
     }
 
     private func buildSystemPrompt() -> String {
         """
-        Bạn là chuyên gia kỹ thuật đảo ngược iOS (Reverse Engineering, Sideloading, Mach-O, Info.plist, IPA modding) được tích hợp trực tiếp trong ứng dụng TueeHub IPA Studio.
-        Trả lời bằng tiếng Việt ngắn gọn, kỹ thuật chuẩn xác, đi thẳng vào vấn đề.
+        Bạn là chuyên gia iOS Reverse Engineering & IPA Modding trong app TueeHub IPA Studio. Trả lời tiếng Việt ngắn gọn, đúng trọng tâm.
 
-        Dưới đây là toàn bộ dữ liệu thực tế trích xuất từ file IPA người dùng đang mở:
-        \(buildDeepIPAContext())
+        Dữ liệu IPA hiện tại:
+        \(buildIPAContext())
 
-        QUY TẮC CHỈNH SỬA TỰ ĐỘNG (QUAN TRỌNG):
-        - Khi người dùng yêu cầu chỉnh sửa bất kỳ gì trong file IPA (đổi tên, đổi Bundle ID, bật File Sharing, xóa PlugIns/Watch/_CodeSignature, xóa giới hạn thiết bị, sửa key Info.plist, sửa file json/plist/strings...), bên cạnh lời giải thích ngắn gọn, BẮT BUỘC xuất thêm ĐÚNG MỘT khối code ```ipa_patch chứa JSON hợp lệ theo định dạng sau để ứng dụng thực thi thật lên tệp:
-
+        QUY TẮC SỬA TỰ ĐỘNG:
+        Khi người dùng yêu cầu chỉnh sửa IPA, bên cạnh giải thích ngắn, xuất ĐÚNG MỘT khối ```ipa_patch chứa JSON hợp lệ:
         ```ipa_patch
         {
-          "summary": "Mô tả ngắn gói chỉnh sửa",
+          "summary": "Mô tả ngắn",
           "actions": [
             {"type": "set_plist", "key": "CFBundleDisplayName", "value": "TenMoi", "valueType": "string"},
             {"type": "set_plist", "key": "UIFileSharingEnabled", "value": "true", "valueType": "bool"},
             {"type": "delete_plist", "key": "UISupportedDevices"},
             {"type": "delete_path", "path": "PlugIns"},
-            {"type": "patch_plist_file", "path": "Sub/File.plist", "key": "SomeKey", "value": "123", "valueType": "int"},
+            {"type": "patch_plist_file", "path": "Sub/File.plist", "key": "Key", "value": "123", "valueType": "int"},
             {"type": "write_text_file", "path": "config.json", "content": "{...}"},
             {"type": "replace_in_file", "path": "file.txt", "find": "old", "replace": "new"}
           ]
         }
         ```
-
-        - Các `type` hợp lệ: `set_plist`, `delete_plist`, `patch_plist_file`, `delete_path`, `write_text_file`, `replace_in_file`.
-        - Các `valueType` hợp lệ: `string`, `bool`, `int`, `array`.
-        - `path` tính tương đối từ bên trong thư mục `.app` (ví dụ `PlugIns`, `Watch`, `_CodeSignature`, `Frameworks/AdSDK.framework`, `config.json`).
-        - Nếu người dùng chỉ hỏi/phân tích mà không kêu sửa, KHÔNG cần xuất khối `ipa_patch`.
+        `type`: set_plist | delete_plist | patch_plist_file | delete_path | write_text_file | replace_in_file.
+        `valueType`: string | bool | int | array. `path` tính từ bên trong `.app`.
+        Nếu người dùng chỉ hỏi/phân tích, KHÔNG xuất khối ipa_patch.
         """
     }
 
@@ -1562,47 +1670,75 @@ final class IPAStudioManager: ObservableObject {
         guard !trimmed.isEmpty, !isAIThinking else { return }
 
         messages.append(AIMessage(isUser: true, text: trimmed, modelBadge: nil, patch: nil))
-        isAIThinking = true
 
         let provider = selectedProvider
         let model = selectedModel
         let key = currentAPIKey
         let endpoint = customEndpoint
         let sysPrompt = buildSystemPrompt()
-        let history = messages.suffix(10).map { AIChatTurn(isUser: $0.isUser, text: $0.text) }
+        let history = messages.suffix(6).map { AIChatTurn(isUser: $0.isUser, text: $0.text) }
 
-        Task {
+        let placeholder = AIMessage(
+            isUser: false,
+            text: "",
+            modelBadge: "\(provider.rawValue) • \(model)",
+            patch: nil,
+            isStreaming: true
+        )
+        let replyID = placeholder.id
+        messages.append(placeholder)
+        isAIThinking = true
+
+        aiStreamTask = Task {
             do {
-                let reply = try await AIClient.send(
+                let fullReply = try await AIClient.stream(
                     provider: provider,
                     model: model,
                     apiKey: key,
                     customEndpoint: endpoint,
                     systemPrompt: sysPrompt,
                     history: history
-                )
-                let parsed = AIPatchEngine.extractPatch(from: reply)
-                self.messages.append(
-                    AIMessage(
-                        isUser: false,
-                        text: parsed.cleanText.isEmpty ? (parsed.patch?.summary ?? "Đã tạo gói chỉnh sửa.") : parsed.cleanText,
-                        modelBadge: "\(provider.rawValue) • \(model)",
-                        patch: parsed.patch
-                    )
-                )
-                self.isAIThinking = false
-                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                ) { chunk in
+                    await MainActor.run {
+                        if let idx = self.messages.firstIndex(where: { $0.id == replyID }) {
+                            self.messages[idx].text += chunk
+                        }
+                    }
+                }
+
+                await MainActor.run {
+                    if let idx = self.messages.firstIndex(where: { $0.id == replyID }) {
+                        self.messages[idx].isStreaming = false
+                        let finalRaw = fullReply.isEmpty ? self.messages[idx].text : fullReply
+                        let parsed = AIPatchEngine.extractPatch(from: finalRaw)
+                        self.messages[idx].text = parsed.cleanText.isEmpty ? (parsed.patch?.summary ?? "Đã hoàn tất.") : parsed.cleanText
+                        self.messages[idx].patch = parsed.patch
+                    }
+                    self.isAIThinking = false
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                }
             } catch {
-                self.isAIThinking = false
-                self.messages.append(
-                    AIMessage(
-                        isUser: false,
-                        text: "❌ \(error.localizedDescription)",
-                        modelBadge: provider.rawValue,
-                        patch: nil
-                    )
-                )
+                await MainActor.run {
+                    if let idx = self.messages.firstIndex(where: { $0.id == replyID }) {
+                        self.messages[idx].isStreaming = false
+                        if !Task.isCancelled {
+                            self.messages[idx].text = "❌ \(error.localizedDescription)"
+                        } else if self.messages[idx].text.isEmpty {
+                            self.messages[idx].text = "Đã dừng."
+                        }
+                    }
+                    self.isAIThinking = false
+                }
             }
+        }
+    }
+
+    func stopAI() {
+        aiStreamTask?.cancel()
+        aiStreamTask = nil
+        isAIThinking = false
+        for i in messages.indices where messages[i].isStreaming {
+            messages[i].isStreaming = false
         }
     }
 
@@ -1677,7 +1813,7 @@ struct ContentView: View {
             }
         }
         .preferredColorScheme(.dark)
-        .alert("IPA Studio", isPresented: Binding(
+        .alert("TueeHub IPA Studio", isPresented: Binding(
             get: { store.alertMessage != nil },
             set: { if !$0 { store.alertMessage = nil } }
         )) {
@@ -1688,7 +1824,7 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Tab 1: IPA Overview, Mach-O Deep Inspector & Quick Editor
+// MARK: - Tab 1: IPA Overview & Deep Inspector
 struct IPAOverviewTab: View {
     @ObservedObject var store: IPAStudioManager
 
@@ -1703,99 +1839,104 @@ struct IPAOverviewTab: View {
         NavigationStack {
             Group {
                 if let sum = store.summary {
-                    Form {
-                        // Header thông tin IPA
+                    List {
+                        // Hero Card gọn gàng chuẩn Apple
                         Section {
-                            HStack(spacing: 14) {
-                                if let iconURL = sum.iconPath, let img = UIImage(contentsOfFile: iconURL.path) {
-                                    Image(uiImage: img)
-                                        .resizable()
-                                        .scaledToFill()
-                                        .frame(width: 62, height: 62)
-                                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                                } else {
-                                    Image(systemName: "app.dashed")
-                                        .font(.system(size: 32))
-                                        .frame(width: 62, height: 62)
-                                        .background(Color.secondary.opacity(0.2))
-                                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                            VStack(spacing: 14) {
+                                HStack(spacing: 14) {
+                                    if let iconURL = sum.iconPath, let img = UIImage(contentsOfFile: iconURL.path) {
+                                        Image(uiImage: img)
+                                            .resizable()
+                                            .scaledToFill()
+                                            .frame(width: 64, height: 64)
+                                            .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
+                                    } else {
+                                        Image(systemName: "app.dashed")
+                                            .font(.system(size: 30))
+                                            .frame(width: 64, height: 64)
+                                            .background(Color.secondary.opacity(0.18))
+                                            .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
+                                    }
+
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(sum.displayName)
+                                            .font(.title3.bold())
+                                            .lineLimit(1)
+                                        Text(sum.bundleID)
+                                            .font(.caption.monospaced())
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+
+                                        HStack(spacing: 6) {
+                                            Text("v\(sum.version)")
+                                                .font(.caption2.bold())
+                                                .padding(.horizontal, 7)
+                                                .padding(.vertical, 2)
+                                                .background(Color.blue.opacity(0.2))
+                                                .foregroundStyle(.blue)
+                                                .clipShape(Capsule())
+
+                                            if let enc = sum.machO?.isEncrypted {
+                                                Text(enc ? "FairPlay Mã hóa" : "Đã giải mã")
+                                                    .font(.caption2.bold())
+                                                    .padding(.horizontal, 7)
+                                                    .padding(.vertical, 2)
+                                                    .background((enc ? Color.red : Color.green).opacity(0.2))
+                                                    .foregroundStyle(enc ? .red : .green)
+                                                    .clipShape(Capsule())
+                                            }
+                                        }
+                                    }
+                                    Spacer()
                                 }
 
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(sum.displayName).font(.headline)
-                                    Text(sum.bundleID)
-                                        .font(.caption.monospaced())
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
-                                    Text("v\(sum.version) (\(sum.buildNumber)) • \(sum.totalFilesCount) tệp • SHA \(sum.sha256Short)")
-                                        .font(.caption2.monospaced())
-                                        .foregroundStyle(.blue)
+                                // 3 ô thông số nhanh
+                                HStack(spacing: 8) {
+                                    QuickStatTile(title: "Tệp", value: "\(sum.totalFilesCount)")
+                                    QuickStatTile(title: "Kiến trúc", value: sum.machO?.architectures.first ?? "N/A")
+                                    QuickStatTile(title: "Dylib nhúng", value: "\(sum.machO?.injectedDylibs.count ?? 0)")
                                 }
+
+                                Button {
+                                    store.exportEditedIPA()
+                                } label: {
+                                    Label("Đóng gói & Xuất IPA đã sửa", systemImage: "square.and.arrow.up.fill")
+                                        .font(.headline)
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 4)
+                                }
+                                .buttonStyle(.borderedProminent)
                             }
                             .padding(.vertical, 4)
-
-                            Button {
-                                store.exportEditedIPA()
-                            } label: {
-                                Label("Đóng gói & Xuất file IPA đã sửa", systemImage: "square.and.arrow.up.fill")
-                                    .font(.headline)
-                                    .frame(maxWidth: .infinity)
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .listRowBackground(Color.clear)
-                            .listRowInsets(EdgeInsets())
                         }
 
-                        // Mach-O Deep Inspection
+                        // Mach-O Binary Inspector
                         if let m = sum.machO {
                             Section("Soi Mach-O Binary (\(m.executableName))") {
-                                LabeledContent("Kiến trúc", value: m.architectures.joined(separator: ", "))
-                                HStack {
-                                    Text("Mã hóa FairPlay")
-                                    Spacer()
-                                    if let enc = m.isEncrypted {
-                                        Text(enc ? "Còn mã hóa (cryptid=\(m.cryptID ?? 1))" : "Đã giải mã (Decrypted)")
-                                            .font(.subheadline.bold())
-                                            .foregroundStyle(enc ? .red : .green)
-                                    } else {
-                                        Text("Không mã hóa").foregroundStyle(.secondary)
-                                    }
-                                }
                                 LabeledContent("Dung lượng Binary", value: ByteCountFormatter.string(fromByteCount: m.fileSizeBytes, countStyle: .file))
+                                LabeledContent("SHA-256", value: sum.sha256Short)
                                 if let sdk = m.sdkVersion {
                                     LabeledContent("Build SDK / MinOS", value: "iOS \(sdk) / \(m.minOSVersion ?? "N/A")")
                                 }
                                 NavigationLink {
                                     DylibListView(machO: m)
                                 } label: {
-                                    LabeledContent("Dylib / Tweak nhúng", value: "\(m.injectedDylibs.count) nhúng / \(m.linkedDylibs.count) tổng")
+                                    LabeledContent("Thư viện Dylib", value: "\(m.injectedDylibs.count) nhúng • \(m.linkedDylibs.count) tổng")
                                 }
                             }
                         }
 
                         // Chỉnh sửa nhanh Info.plist
                         Section("Chỉnh sửa nhanh Info.plist") {
-                            TextField("Tên hiển thị", text: $editName)
-                            TextField("Bundle ID", text: $editBundleID)
-                                .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled()
-                            HStack {
-                                Text("Version")
-                                Spacer()
-                                TextField("1.0", text: $editVersion)
-                                    .multilineTextAlignment(.trailing)
-                            }
-                            HStack {
-                                Text("MinimumOSVersion")
-                                Spacer()
-                                TextField("15.0", text: $editMinOS)
-                                    .multilineTextAlignment(.trailing)
-                            }
+                            LabeledFieldRow(label: "Tên app", text: $editName, placeholder: "Tên hiển thị")
+                            LabeledFieldRow(label: "Bundle ID", text: $editBundleID, placeholder: "com.example.app", isCode: true)
+                            LabeledFieldRow(label: "Version", text: $editVersion, placeholder: "1.0", isCode: true)
+                            LabeledFieldRow(label: "Min iOS", text: $editMinOS, placeholder: "15.0", isCode: true)
                             Toggle("Bật Chia sẻ tệp (UIFileSharing)", isOn: $editFileSharing)
                             if sum.hasSupportedDevicesLimit {
-                                Toggle("Gỡ giới hạn thiết bị (UISupportedDevices)", isOn: $removeDeviceLimit)
+                                Toggle("Gỡ giới hạn thiết bị", isOn: $removeDeviceLimit)
                             }
-                            Button("Lưu thay đổi Info.plist") {
+                            Button {
                                 store.applyManualEdits(
                                     name: editName,
                                     bundleID: editBundleID,
@@ -1804,14 +1945,23 @@ struct IPAOverviewTab: View {
                                     fileSharing: editFileSharing,
                                     removeDeviceLimit: removeDeviceLimit
                                 )
+                            } label: {
+                                Text("Lưu thay đổi Info.plist")
+                                    .fontWeight(.semibold)
+                                    .frame(maxWidth: .infinity)
                             }
-                            .fontWeight(.semibold)
                         }
 
-                        // Dọn dẹp nhanh trước khi ký
-                        Section("Dọn gói trước khi ký") {
+                        // Dọn gói Sideload
+                        Section("Dọn gói & Tối ưu Sideload") {
+                            Button {
+                                store.cleanAllForSideload()
+                            } label: {
+                                Label("Tối ưu toàn bộ 1 chạm (Xóa rác + Bật FileSharing)", systemImage: "wand.and.stars")
+                            }
+
                             if sum.hasPlugIns {
-                                Button("Xóa thư mục PlugIns (\(sum.pluginNames.count) extension)", role: .destructive) {
+                                Button("Xóa PlugIns (\(sum.pluginNames.count) extension)", role: .destructive) {
                                     store.removeFolderFromApp("PlugIns")
                                 }
                             }
@@ -1825,21 +1975,16 @@ struct IPAOverviewTab: View {
                                     store.removeFolderFromApp("_CodeSignature")
                                 }
                             }
-                            if !sum.hasPlugIns && !sum.hasWatchDir && !sum.hasCodeSignature {
-                                Text("Gói IPA đã sạch (không có PlugIns, Watch, _CodeSignature).")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
                         }
 
                         if let prov = sum.provisionSummary {
-                            Section("Chứng chỉ đính kèm sẵn") {
+                            Section("Provisioning Profile nhúng sẵn") {
                                 Text(prov).font(.caption.monospaced())
                             }
                         }
 
                         if !store.changeLog.isEmpty {
-                            Section("Nhật ký chỉnh sửa") {
+                            Section("Nhật ký thay đổi") {
                                 ForEach(store.changeLog.prefix(8), id: \.self) { log in
                                     Text(log).font(.caption.monospaced())
                                 }
@@ -1850,30 +1995,16 @@ struct IPAOverviewTab: View {
                     .onChange(of: sum.bundleID) { _ in syncForm(sum) }
                     .onChange(of: sum.displayName) { _ in syncForm(sum) }
                 } else {
-                    VStack(spacing: 16) {
-                        Image(systemName: "shippingbox.and.arrow.backward")
-                            .font(.system(size: 56))
-                            .foregroundStyle(.blue)
-                        Text("Chưa mở file IPA nào")
-                            .font(.title2.bold())
-                        Text("Nhập file .ipa từ app Tệp để giải nén, soi Mach-O/Info.plist và để AI chỉnh sửa chuyên sâu.")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
-                            .padding(.horizontal, 32)
-                        Button {
-                            NativeFilePicker.shared.pick { urls in
-                                if let first = urls.first { store.importIPA(from: first) }
-                            }
-                        } label: {
-                            Label("Nhập file .IPA", systemImage: "plus.circle.fill")
-                                .font(.headline)
-                                .padding(.horizontal, 22)
-                                .padding(.vertical, 12)
+                    EmptyWorkspaceView(
+                        icon: "shippingbox.and.arrow.backward",
+                        title: "Chưa mở file IPA",
+                        subtitle: "Nhập file .ipa từ app Tệp để giải nén, soi Mach-O/Info.plist và để AI chỉnh sửa tự động.",
+                        actionTitle: "Nhập file .IPA"
+                    ) {
+                        NativeFilePicker.shared.pick { urls in
+                            if let first = urls.first { store.importIPA(from: first) }
                         }
-                        .buttonStyle(.borderedProminent)
                     }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
             .navigationTitle("IPA Studio")
@@ -1884,7 +2015,7 @@ struct IPAOverviewTab: View {
                             if let first = urls.first { store.importIPA(from: first) }
                         }
                     } label: {
-                        Label("Nhập IPA", systemImage: "plus")
+                        Image(systemName: "plus")
                     }
                 }
                 if store.summary != nil {
@@ -1910,6 +2041,80 @@ struct IPAOverviewTab: View {
     }
 }
 
+struct QuickStatTile: View {
+    let title: String
+    let value: String
+
+    var body: some View {
+        VStack(spacing: 3) {
+            Text(value)
+                .font(.subheadline.bold().monospaced())
+                .lineLimit(1)
+            Text(title)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 8)
+        .background(Color(uiColor: .tertiarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+}
+
+struct LabeledFieldRow: View {
+    let label: String
+    @Binding var text: String
+    let placeholder: String
+    var isCode: Bool = false
+
+    var body: some View {
+        HStack {
+            Text(label)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 12)
+            TextField(placeholder, text: $text)
+                .multilineTextAlignment(.trailing)
+                .font(isCode ? .subheadline.monospaced() : .subheadline)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(isCode ? .never : .sentences)
+        }
+    }
+}
+
+struct EmptyWorkspaceView: View {
+    let icon: String
+    let title: String
+    let subtitle: String
+    var actionTitle: String? = nil
+    var action: (() -> Void)? = nil
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Image(systemName: icon)
+                .font(.system(size: 50))
+                .foregroundStyle(.blue)
+            Text(title)
+                .font(.title3.bold())
+            Text(subtitle)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 32)
+            if let actionTitle = actionTitle, let action = action {
+                Button(action: action) {
+                    Label(actionTitle, systemImage: "plus.circle.fill")
+                        .font(.headline)
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.borderedProminent)
+                .padding(.top, 4)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
 struct DylibListView: View {
     let machO: MachOInfo
 
@@ -1921,7 +2126,7 @@ struct DylibListView: View {
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(machO.injectedDylibs, id: \.self) { path in
-                        Text(path).font(.caption.monospaced())
+                        Text(path).font(.caption.monospaced()).textSelection(.enabled)
                     }
                 }
             }
@@ -1944,71 +2149,70 @@ struct DylibListView: View {
     }
 }
 
-// MARK: - Tab 2: AI Studio (Multi-API Picker + Auto-Patch Engine)
+// MARK: - Tab 2: AI Studio (Streaming SSE + Fast/Deep Toggle)
 struct AIStudioTab: View {
     @ObservedObject var store: IPAStudioManager
     @State private var inputText = ""
     @State private var showModelPicker = false
 
     private let quickPrompts: [(title: String, prompt: String)] = [
-        ("Soi toàn diện IPA", "Hãy soi kỹ toàn bộ file IPA này: kiểm tra mã hóa FairPlay, các quyền nhạy cảm trong Info.plist, dylib/tweak đã nhúng, PlugIns thừa và chỉ ra điểm cần tối ưu."),
-        ("Tối ưu để Sideload", "Hãy chỉnh gói IPA này tối ưu nhất để cài sideload: bật UIFileSharingEnabled, gỡ UISupportedDevices, xóa PlugIns, Watch và _CodeSignature."),
-        ("Bật chia sẻ tệp", "Bật chia sẻ tệp UIFileSharingEnabled và LSSupportsOpeningDocumentsInPlace trong Info.plist giúp tôi."),
-        ("Tìm quảng cáo / SDK", "Kiểm tra Info.plist, Frameworks và cây thư mục xem có SDK quảng cáo hoặc tracking nào không và hướng dẫn xử lý.")
+        ("Soi toàn diện", "Soi nhanh toàn bộ file IPA: mã hóa FairPlay, dylib/tweak nhúng, PlugIns thừa và đề xuất chỉnh sửa."),
+        ("Tối ưu Sideload", "Chỉnh gói IPA tối ưu để cài sideload: bật UIFileSharingEnabled, gỡ UISupportedDevices, xóa PlugIns, Watch và _CodeSignature."),
+        ("Tìm Ads / Tracking", "Kiểm tra Frameworks và cấu trúc gói xem có SDK quảng cáo hoặc tracking nào không và cách xử lý."),
+        ("Đổi Bundle ID", "Tạo bản sửa đổi Bundle ID thành bản nhân bản (thêm đuôi .clone) và đổi tên hiển thị kèm hậu tố Clone.")
     ]
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                // Thanh trạng thái Model AI + Tệp ghim
-                HStack(spacing: 10) {
+                // Thanh Model + Chế độ Nhanh/Sâu
+                HStack(spacing: 8) {
                     Button {
                         showModelPicker = true
                     } label: {
                         HStack(spacing: 6) {
-                            Image(systemName: store.selectedProvider.icon)
-                                .foregroundStyle(.blue)
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(store.selectedProvider.rawValue)
-                                    .font(.caption.bold())
-                                    .foregroundStyle(.primary)
-                                Text(store.selectedModel)
-                                    .font(.caption2.monospaced())
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                            }
+                            Circle()
+                                .fill(store.currentAPIKey.isEmpty ? Color.orange : Color.green)
+                                .frame(width: 8, height: 8)
+                            Text(store.selectedModel)
+                                .font(.caption.bold().monospaced())
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
                             Image(systemName: "chevron.down")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 7)
                         .background(Color(uiColor: .secondarySystemGroupedBackground))
                         .clipShape(Capsule())
                     }
 
                     Spacer()
 
-                    if !store.pinnedFilesForAI.isEmpty {
-                        Text("Ghim \(store.pinnedFilesForAI.count) tệp")
-                            .font(.caption2.bold())
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(Color.purple.opacity(0.2))
-                            .foregroundStyle(.purple)
-                            .clipShape(Capsule())
+                    Picker("Ngữ cảnh", selection: $store.contextDepth) {
+                        ForEach(AIContextDepth.allCases) { d in
+                            Text(d.rawValue).tag(d)
+                        }
                     }
-
-                    Circle()
-                        .fill(store.currentAPIKey.isEmpty ? Color.orange : Color.green)
-                        .frame(width: 9, height: 9)
+                    .pickerStyle(.segmented)
+                    .frame(width: 118)
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 8)
 
-                // Nút lệnh nhanh 1 chạm
+                // Lệnh nhanh 1 chạm
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
+                        if !store.pinnedFilesForAI.isEmpty {
+                            Text("✨ \(store.pinnedFilesForAI.count) tệp ghim")
+                                .font(.caption.bold())
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(Color.purple.opacity(0.2))
+                                .foregroundStyle(.purple)
+                                .clipShape(Capsule())
+                        }
                         ForEach(quickPrompts, id: \.title) { item in
                             Button {
                                 store.sendMessage(item.prompt)
@@ -2016,7 +2220,7 @@ struct AIStudioTab: View {
                                 Text(item.title)
                                     .font(.caption.weight(.semibold))
                                     .padding(.horizontal, 12)
-                                    .padding(.vertical, 7)
+                                    .padding(.vertical, 6)
                                     .background(Color(uiColor: .secondarySystemGroupedBackground))
                                     .foregroundStyle(.primary)
                                     .clipShape(Capsule())
@@ -2030,7 +2234,7 @@ struct AIStudioTab: View {
 
                 Divider()
 
-                // Khung hội thoại AI
+                // Khung hội thoại Streaming
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 14) {
@@ -2042,46 +2246,49 @@ struct AIStudioTab: View {
                                 )
                                 .id(msg.id)
                             }
-                            if store.isAIThinking {
-                                HStack(spacing: 8) {
-                                    ProgressView()
-                                    Text("AI đang soi sâu file IPA...")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                .padding(.horizontal, 14)
-                            }
                         }
                         .padding(14)
                     }
                     .onChange(of: store.messages.count) { _ in
                         if let last = store.messages.last {
-                            withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                            withAnimation(.easeOut(duration: 0.2)) {
+                                proxy.scrollTo(last.id, anchor: .bottom)
+                            }
                         }
                     }
                 }
 
                 Divider()
 
-                // Ô nhập lệnh
+                // Ô nhập lệnh + nút Gửi / Dừng
                 HStack(spacing: 10) {
                     TextField("Yêu cầu AI soi hoặc sửa IPA...", text: $inputText, axis: .vertical)
                         .lineLimit(1...4)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 9)
                         .background(Color(uiColor: .secondarySystemGroupedBackground))
-                        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
 
-                    Button {
-                        let text = inputText
-                        inputText = ""
-                        store.sendMessage(text)
-                    } label: {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.system(size: 32))
-                            .foregroundStyle(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || store.isAIThinking ? .gray : .blue)
+                    if store.isAIThinking {
+                        Button {
+                            store.stopAI()
+                        } label: {
+                            Image(systemName: "stop.circle.fill")
+                                .font(.system(size: 32))
+                                .foregroundStyle(.red)
+                        }
+                    } else {
+                        Button {
+                            let text = inputText
+                            inputText = ""
+                            store.sendMessage(text)
+                        } label: {
+                            Image(systemName: "arrow.up.circle.fill")
+                                .font(.system(size: 32))
+                                .foregroundStyle(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .gray : .blue)
+                        }
+                        .disabled(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
-                    .disabled(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || store.isAIThinking)
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
@@ -2093,11 +2300,12 @@ struct AIStudioTab: View {
                     Button {
                         showModelPicker = true
                     } label: {
-                        Label("Model AI", systemImage: "slider.horizontal.3")
+                        Image(systemName: "slider.horizontal.3")
                     }
                 }
                 ToolbarItem(placement: .topBarLeading) {
                     Button {
+                        store.stopAI()
                         store.messages.removeAll()
                     } label: {
                         Image(systemName: "trash")
@@ -2119,25 +2327,48 @@ struct AIMessageBubble: View {
     var body: some View {
         VStack(alignment: message.isUser ? .trailing : .leading, spacing: 6) {
             if let badge = message.modelBadge {
-                Text(badge)
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 6) {
+                    Text(badge)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                    if message.isStreaming {
+                        ProgressView().scaleEffect(0.65)
+                    }
+                }
             }
 
-            Text(message.text)
-                .font(.subheadline)
-                .textSelection(.enabled)
-                .padding(12)
-                .background(message.isUser ? Color.blue : Color(uiColor: .secondarySystemGroupedBackground))
-                .foregroundStyle(message.isUser ? .white : .primary)
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            Group {
+                if message.text.isEmpty && message.isStreaming {
+                    HStack(spacing: 8) {
+                        ProgressView().scaleEffect(0.8)
+                        Text("Đang kết nối...")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text(message.text)
+                        .font(.subheadline)
+                        .textSelection(.enabled)
+                }
+            }
+            .padding(12)
+            .background(message.isUser ? Color.blue : Color(uiColor: .secondarySystemGroupedBackground))
+            .foregroundStyle(message.isUser ? .white : .primary)
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .contextMenu {
+                Button {
+                    UIPasteboard.general.string = message.text
+                } label: {
+                    Label("Sao chép nội dung", systemImage: "doc.on.doc")
+                }
+            }
 
             if let patch = message.patch {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
                         Image(systemName: "wand.and.stars")
                             .foregroundStyle(.green)
-                        Text(patch.summary ?? "Gói chỉnh sửa AI đề xuất (\(patch.actions.count) bước)")
+                        Text(patch.summary ?? "Gói chỉnh sửa AI (\(patch.actions.count) bước)")
                             .font(.subheadline.bold())
                     }
 
@@ -2150,9 +2381,7 @@ struct AIMessageBubble: View {
                         }
                     }
 
-                    Button {
-                        onApply()
-                    } label: {
+                    Button(action: onApply) {
                         Label(
                             message.patchApplied ? "Đã áp dụng vào IPA" : "Áp dụng ngay vào IPA",
                             systemImage: message.patchApplied ? "checkmark.circle.fill" : "bolt.fill"
@@ -2181,7 +2410,7 @@ struct AIModelSelectorSheet: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("1. Chọn nhà cung cấp AI API") {
+                Section("1. Nhà cung cấp AI API") {
                     ForEach(AIProvider.allCases) { provider in
                         Button {
                             store.switchProvider(provider)
@@ -2191,7 +2420,7 @@ struct AIModelSelectorSheet: View {
                                     .foregroundStyle(.primary)
                                 Spacer()
                                 if !(store.apiKeys[provider.rawValue] ?? "").isEmpty {
-                                    Text("Có Key")
+                                    Text("Sẵn sàng")
                                         .font(.caption2.bold())
                                         .foregroundStyle(.green)
                                 }
@@ -2203,7 +2432,7 @@ struct AIModelSelectorSheet: View {
                     }
                 }
 
-                Section("2. Chọn Model (\(store.selectedProvider.rawValue))") {
+                Section("2. Model (\(store.selectedProvider.rawValue))") {
                     ForEach(store.selectedProvider.presetModels, id: \.self) { m in
                         Button {
                             store.selectedModel = m
@@ -2221,7 +2450,7 @@ struct AIModelSelectorSheet: View {
                     }
 
                     HStack {
-                        TextField("Hoặc tự gõ tên model bất kỳ...", text: $customModelInput)
+                        TextField("Nhập tên model tùy chỉnh...", text: $customModelInput)
                             .font(.caption.monospaced())
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
@@ -2255,7 +2484,7 @@ struct AIModelSelectorSheet: View {
                     }
                 }
             }
-            .navigationTitle("Chọn Model & API AI")
+            .navigationTitle("Chọn Model & API")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -2275,16 +2504,11 @@ struct FileExplorerTab: View {
             if let sum = store.summary {
                 FolderBrowserView(folderURL: sum.appBundleURL, title: sum.appBundleURL.lastPathComponent, store: store)
             } else {
-                VStack(spacing: 12) {
-                    Image(systemName: "folder.badge.questionmark")
-                        .font(.system(size: 48))
-                        .foregroundStyle(.secondary)
-                    Text("Chưa có file IPA để duyệt")
-                        .font(.headline)
-                    Text("Vào tab IPA để nhập và giải nén file .ipa trước.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                EmptyWorkspaceView(
+                    icon: "folder.badge.questionmark",
+                    title: "Chưa có file IPA để duyệt",
+                    subtitle: "Vào tab IPA để nhập và giải nén file .ipa trước."
+                )
                 .navigationTitle("Tệp IPA")
             }
         }
@@ -2312,8 +2536,8 @@ struct FolderBrowserView: View {
                     NavigationLink {
                         FolderBrowserView(folderURL: node.url, title: node.name, store: store)
                     } label: {
-                        HStack {
-                            Image(systemName: "folder.fill").foregroundStyle(.blue)
+                        HStack(spacing: 10) {
+                            Image(systemName: node.iconName).foregroundStyle(node.iconColor)
                             Text(node.name).lineLimit(1)
                         }
                     }
@@ -2321,9 +2545,8 @@ struct FolderBrowserView: View {
                     NavigationLink {
                         FileDetailEditorView(node: node, store: store)
                     } label: {
-                        HStack {
-                            Image(systemName: node.isTextEditable ? "doc.text.fill" : "doc.fill")
-                                .foregroundStyle(node.isTextEditable ? .green : .secondary)
+                        HStack(spacing: 10) {
+                            Image(systemName: node.iconName).foregroundStyle(node.iconColor)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(node.name).lineLimit(1)
                                 Text(node.formattedSize)
@@ -2350,7 +2573,7 @@ struct FolderBrowserView: View {
             }
         }
         .navigationTitle(title)
-        .searchable(text: $searchText, prompt: "Lọc tên tệp...")
+        .searchable(text: $searchText, prompt: "Tìm tệp trong thư mục...")
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
@@ -2359,7 +2582,7 @@ struct FolderBrowserView: View {
                         refreshTick += 1
                     }
                 } label: {
-                    Label("Chèn tệp", systemImage: "doc.badge.plus")
+                    Image(systemName: "doc.badge.plus")
                 }
             }
         }
@@ -2371,6 +2594,7 @@ struct FileDetailEditorView: View {
     @ObservedObject var store: IPAStudioManager
     @State private var textContent = ""
     @State private var hexPreview = ""
+    @State private var previewImage: UIImage?
     @State private var isPlist = false
     @State private var saveNotice: String?
 
@@ -2393,10 +2617,41 @@ struct FileDetailEditorView: View {
                     .font(.system(size: 12.5, design: .monospaced))
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
+            } else if node.isImageFile {
+                ScrollView {
+                    VStack(spacing: 16) {
+                        if let img = previewImage {
+                            Image(uiImage: img)
+                                .resizable()
+                                .scaledToFit()
+                                .frame(maxHeight: 320)
+                                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                                .padding(.top, 20)
+                            Text("\(Int(img.size.width)) × \(Int(img.size.height)) px • \(node.formattedSize)")
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                        }
+                        Button {
+                            NativeFilePicker.shared.pick(types: [.image, .png, .jpeg]) { urls in
+                                if let picked = urls.first {
+                                    store.replaceFile(at: node.url, with: picked, relativePath: node.relativePath)
+                                    previewImage = UIImage(contentsOfFile: node.url.path)
+                                    saveNotice = "✓ Đã thay ảnh thành công"
+                                }
+                            }
+                        } label: {
+                            Label("Thay ảnh này từ Tệp", systemImage: "photo.badge.arrow.down")
+                                .font(.headline)
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                }
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 10) {
-                        Text("Tệp nhị phân (\(node.formattedSize)) — Xem trước 2KB Hex:")
+                        Text("Tệp nhị phân (\(node.formattedSize)) — 2KB Hex đầu tiên:")
                             .font(.caption.bold())
                             .foregroundStyle(.secondary)
                         Text(hexPreview)
@@ -2411,14 +2666,14 @@ struct FileDetailEditorView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
-                Button {
-                    store.togglePinForAI(node.relativePath)
-                } label: {
-                    Image(systemName: isPinned ? "sparkles.rectangle.stack.fill" : "sparkles")
-                        .foregroundStyle(isPinned ? .purple : .primary)
-                }
-
                 if node.isTextEditable {
+                    Button {
+                        store.togglePinForAI(node.relativePath)
+                    } label: {
+                        Image(systemName: isPinned ? "sparkles.rectangle.stack.fill" : "sparkles")
+                            .foregroundStyle(isPinned ? .purple : .primary)
+                    }
+
                     Button("Lưu") { saveFile() }
                         .fontWeight(.semibold)
                 }
@@ -2437,16 +2692,21 @@ struct FileDetailEditorView: View {
             } else {
                 textContent = "// Không đọc được dưới dạng UTF-8"
             }
+        } else if node.isImageFile {
+            previewImage = UIImage(contentsOfFile: node.url.path)
         } else {
             if let handle = try? FileHandle(forReadingFrom: node.url),
                let sample = try? handle.read(upToCount: 2048) {
                 try? handle.close()
+                let bytes = [UInt8](sample)
                 var lines: [String] = []
-                for offset in stride(from: 0, to: sample.count, by: 16) {
-                    let slice = sample[offset..<min(offset + 16, sample.count)]
+                for offset in stride(from: 0, to: bytes.count, by: 16) {
+                    let end = min(offset + 16, bytes.count)
+                    let slice = bytes[offset..<end]
                     let hex = slice.map { String(format: "%02X", $0) }.joined(separator: " ")
+                    let paddedHex = hex.padding(toLength: 47, withPad: " ", startingAt: 0)
                     let ascii = slice.map { ($0 >= 32 && $0 <= 126) ? String(UnicodeScalar($0)) : "." }.joined()
-                    lines.append(String(format: "%04X: %-47s  %@", offset, (hex as NSString).utf8String!, ascii))
+                    lines.append("\(String(format: "%04X", offset)): \(paddedHex)  \(ascii)")
                 }
                 hexPreview = lines.joined(separator: "\n")
             }
@@ -2469,19 +2729,24 @@ struct FileDetailEditorView: View {
     }
 }
 
-// MARK: - Tab 4: All AI APIs & Settings
+// MARK: - Tab 4: AI API Settings
 struct APISettingsTab: View {
     @ObservedObject var store: IPAStudioManager
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("Model AI đang hoạt động") {
+                Section("AI đang hoạt động") {
                     LabeledContent("Nhà cung cấp", value: store.selectedProvider.rawValue)
                     LabeledContent("Model", value: store.selectedModel)
+                    Picker("Độ sâu ngữ cảnh", selection: $store.contextDepth) {
+                        ForEach(AIContextDepth.allCases) { d in
+                            Text(d.rawValue).tag(d)
+                        }
+                    }
                 }
 
-                Section("Kho API Key (Hỗ trợ tất cả nền tảng AI)") {
+                Section("Kho API Key (Tất cả hệ AI)") {
                     ForEach(AIProvider.allCases) { provider in
                         VStack(alignment: .leading, spacing: 6) {
                             HStack {
@@ -2489,7 +2754,7 @@ struct APISettingsTab: View {
                                     .font(.subheadline.bold())
                                 Spacer()
                                 if store.selectedProvider == provider {
-                                    Text("Đang dùng")
+                                    Text("Đang chọn")
                                         .font(.caption2.bold())
                                         .foregroundStyle(.blue)
                                 }
@@ -2517,7 +2782,7 @@ struct APISettingsTab: View {
                 }
 
                 Section("Đóng gói IPA") {
-                    Toggle("Nén ZLIB khi xuất IPA (nhẹ file hơn)", isOn: $store.compressOnExport)
+                    Toggle("Nén ZLIB khi xuất IPA", isOn: $store.compressOnExport)
                     Button("Xóa thư mục giải nén tạm", role: .destructive) {
                         store.clearWorkspace()
                     }
