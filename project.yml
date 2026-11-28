@@ -2,7 +2,7 @@ name: MyFirstApp
 options:
   bundleIdPrefix: com.tenban
   deploymentTarget:
-    iOS: "18.0"
+    iOS: "26.0"
 targets:
   MyFirstApp:
     type: application
