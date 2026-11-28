@@ -496,7 +496,7 @@ enum MachOInspector {
         guard dataSize >= 20, dataSize <= 2_500_000 else { return nil }
         try? handle.seek(toOffset: sliceOffset + UInt64(dataOff))
         guard let sigData = try? handle.read(upToCount: Int(dataSize)), sigData.count >= 20 else { return nil }
-        guard readU32BE(sigData, 0) == 0xFADE0CC0 else { return nil } // CSMAGIC_EMBEDDED_SIGNATURE
+        guard readU32BE(sigData, 0) == 0xFADE0CC0 else { return nil }
         let blobCount = Int(readU32BE(sigData, 8))
         for i in 0..<min(blobCount, 32) {
             let entryPos = 12 + i * 8
@@ -581,7 +581,7 @@ enum MachOInspector {
                     minOS = decodeVersion(readU32LE(cmdData, pos + 12))
                     sdk = decodeVersion(readU32LE(cmdData, pos + 16))
                 }
-            } else if cmd == 0x1D { // LC_CODE_SIGNATURE
+            } else if cmd == 0x1D {
                 if pos + 16 <= cmdData.count {
                     codeSigOff = readU32LE(cmdData, pos + 8)
                     codeSigSize = readU32LE(cmdData, pos + 12)
@@ -701,12 +701,12 @@ enum MachODylibInjector {
         let alignedCmdSize = ((rawCmdSize + 7) / 8) * 8
 
         var newCmd = Data(capacity: alignedCmdSize)
-        appendU32LE(&newCmd, weakLoad ? 0x80000018 : 0x0C) // LC_LOAD_WEAK_DYLIB / LC_LOAD_DYLIB
+        appendU32LE(&newCmd, weakLoad ? 0x80000018 : 0x0C)
         appendU32LE(&newCmd, UInt32(alignedCmdSize))
-        appendU32LE(&newCmd, 24) // offset to name string
-        appendU32LE(&newCmd, 2)  // timestamp
-        appendU32LE(&newCmd, 0x00010000) // current version 1.0.0
-        appendU32LE(&newCmd, 0x00010000) // compatibility version 1.0.0
+        appendU32LE(&newCmd, 24)
+        appendU32LE(&newCmd, 2)
+        appendU32LE(&newCmd, 0x00010000)
+        appendU32LE(&newCmd, 0x00010000)
         newCmd.append(pathBytes)
         while newCmd.count < alignedCmdSize { newCmd.append(0) }
 
@@ -743,7 +743,7 @@ enum MachODylibInjector {
                             alreadyLoaded = true
                         }
                     }
-                } else if cmd == 0x19 && cmdsize >= 72 { // LC_SEGMENT_64
+                } else if cmd == 0x19 && cmdsize >= 72 {
                     let nsects = Int(MachOInspector.readU32LE(cmdData, pos + 64))
                     for s in 0..<nsects {
                         let sectPos = pos + 72 + s * 80
@@ -775,15 +775,14 @@ enum MachODylibInjector {
             modifiedSlices += 1
         }
 
-        // Xóa _CodeSignature cũ vì binary đã thay đổi
         let sigDir = appBundleURL.appendingPathComponent("_CodeSignature")
         if fm.fileExists(atPath: sigDir.path) {
             try? fm.removeItem(at: sigDir)
         }
 
         return modifiedSlices > 0
-            ? "Đã inject \(loadPath) (\(weakLoad ? "Weak" : "Load")) vào \(modifiedSlices) slice Mach-O"
-            : "Đã cập nhật \(dylibName) (lệnh load đã có sẵn trong Mach-O)"
+            ? "Đã inject \(dylibName) (\(weakLoad ? "Weak" : "Load")) vào Mach-O"
+            : "Đã cập nhật \(dylibName) (lệnh load đã tồn tại sẵn)"
     }
 }
 
@@ -1035,7 +1034,13 @@ struct UndoSnapshotEntry {
     let existedBefore: Bool
 }
 
-// MARK: - AI Providers & Dual-Endpoint Streaming SSE Engine
+struct ToastBannerData: Equatable {
+    let id = UUID()
+    let text: String
+    let isError: Bool
+}
+
+// MARK: - AI Providers & High-Speed Resilient Engine (v5.5)
 enum GeminiEndpointMode: String, CaseIterable, Identifiable, Codable, Sendable {
     case auto = "Tự động"
     case vertex = "Vertex AI (aiplatform)"
@@ -1046,12 +1051,12 @@ enum GeminiEndpointMode: String, CaseIterable, Identifiable, Codable, Sendable {
 
 enum AIProvider: String, CaseIterable, Identifiable, Codable, Sendable {
     case gemini = "Google Gemini"
+    case openrouter = "OpenRouter (Free / All)"
     case groq = "Groq (Siêu nhanh)"
     case openai = "OpenAI"
     case claude = "Anthropic Claude"
     case deepseek = "DeepSeek"
     case grok = "xAI Grok"
-    case openrouter = "OpenRouter"
     case custom = "Custom OpenAI API"
 
     var id: String { rawValue }
@@ -1059,12 +1064,12 @@ enum AIProvider: String, CaseIterable, Identifiable, Codable, Sendable {
     var icon: String {
         switch self {
         case .gemini: return "sparkles"
+        case .openrouter: return "network"
         case .groq: return "bolt.fill"
         case .openai: return "brain.head.profile"
         case .claude: return "cpu"
         case .deepseek: return "magnifyingglass.circle"
         case .grok: return "flame.fill"
-        case .openrouter: return "network"
         case .custom: return "server.rack"
         }
     }
@@ -1072,12 +1077,12 @@ enum AIProvider: String, CaseIterable, Identifiable, Codable, Sendable {
     var defaultEndpoint: String {
         switch self {
         case .gemini: return "https://aiplatform.googleapis.com/v1/publishers/google/models"
+        case .openrouter: return "https://openrouter.ai/api/v1/chat/completions"
         case .groq: return "https://api.groq.com/openai/v1/chat/completions"
         case .openai: return "https://api.openai.com/v1/chat/completions"
         case .claude: return "https://api.anthropic.com/v1/messages"
         case .deepseek: return "https://api.deepseek.com/chat/completions"
         case .grok: return "https://api.x.ai/v1/chat/completions"
-        case .openrouter: return "https://openrouter.ai/api/v1/chat/completions"
         case .custom: return "https://api.openai.com/v1/chat/completions"
         }
     }
@@ -1085,7 +1090,9 @@ enum AIProvider: String, CaseIterable, Identifiable, Codable, Sendable {
     var presetModels: [String] {
         switch self {
         case .gemini:
-            return ["gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-3.8-pro"]
+            return ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.5-pro"]
+        case .openrouter:
+            return ["google/gemma-3-27b-it:free", "deepseek/deepseek-r1-0528:free", "meta-llama/llama-3.3-70b-instruct:free", "google/gemini-3.8-flash"]
         case .groq:
             return ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "llama-3.3-70b-versatile"]
         case .openai:
@@ -1096,8 +1103,6 @@ enum AIProvider: String, CaseIterable, Identifiable, Codable, Sendable {
             return ["deepseek-chat", "deepseek-reasoner"]
         case .grok:
             return ["grok-3-mini", "grok-3"]
-        case .openrouter:
-            return ["google/gemini-3.8-flash", "anthropic/claude-sonnet-4", "openai/gpt-4.1", "deepseek/deepseek-chat"]
         case .custom:
             return ["gemini-3.8-flash", "gpt-4o", "claude-sonnet-4"]
         }
@@ -1106,12 +1111,12 @@ enum AIProvider: String, CaseIterable, Identifiable, Codable, Sendable {
     var keyPlaceholder: String {
         switch self {
         case .gemini: return "AQ.Ab8RN... hoặc AIza..."
+        case .openrouter: return "sk-or-v1-..."
         case .groq: return "gsk_..."
         case .openai: return "sk-proj-..."
         case .claude: return "sk-ant-..."
         case .deepseek: return "sk-..."
         case .grok: return "xai-..."
-        case .openrouter: return "sk-or-v1-..."
         case .custom: return "Bearer API Key..."
         }
     }
@@ -1162,6 +1167,7 @@ struct AIMessage: Identifiable, Sendable {
     var patch: AIPatchEnvelope?
     var patchApplied: Bool = false
     var isStreaming: Bool = false
+    var failedPrompt: String? = nil
 }
 
 struct AIChatTurn: Sendable {
@@ -1185,12 +1191,13 @@ enum AIClient {
         return cleaned
     }
 
-    static func stream(
+    static func send(
         provider: AIProvider,
         model: String,
         apiKey: String,
         geminiMode: GeminiEndpointMode,
         customEndpoint: String,
+        useStreaming: Bool,
         systemPrompt: String,
         history: [AIChatTurn],
         onChunk: @escaping @Sendable (String) async -> Void
@@ -1202,121 +1209,144 @@ enum AIClient {
 
         switch provider {
         case .gemini:
-            return try await streamGemini(model: model, apiKey: cleanKey, mode: geminiMode, systemPrompt: systemPrompt, history: history, onChunk: onChunk)
+            return try await callGemini(model: model, apiKey: cleanKey, mode: geminiMode, useStreaming: useStreaming, systemPrompt: systemPrompt, history: history, onChunk: onChunk)
         case .claude:
-            return try await streamClaude(model: model, apiKey: cleanKey, systemPrompt: systemPrompt, history: history, onChunk: onChunk)
-        case .groq, .openai, .deepseek, .grok, .openrouter, .custom:
+            return try await callClaude(model: model, apiKey: cleanKey, useStreaming: useStreaming, systemPrompt: systemPrompt, history: history, onChunk: onChunk)
+        case .openrouter, .groq, .openai, .deepseek, .grok, .custom:
             let customClean = customEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
             let endpoint = (provider == .custom && !customClean.isEmpty) ? customClean : provider.defaultEndpoint
-            return try await streamOpenAI(endpoint: endpoint, model: model, apiKey: cleanKey, systemPrompt: systemPrompt, history: history, onChunk: onChunk)
+            return try await callOpenAI(endpoint: endpoint, model: model, apiKey: cleanKey, useStreaming: useStreaming, systemPrompt: systemPrompt, history: history, onChunk: onChunk)
         }
     }
 
-    private static func streamGemini(
+    private static func callGemini(
         model: String,
         apiKey: String,
         mode: GeminiEndpointMode,
+        useStreaming: Bool,
         systemPrompt: String,
         history: [AIChatTurn],
         onChunk: @escaping @Sendable (String) async -> Void
     ) async throws -> String {
         let cleanModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
         let encodedModel = cleanModel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? cleanModel
+        let methodAction = useStreaming ? "streamGenerateContent" : "generateContent"
 
-        let vertexBase = "https://aiplatform.googleapis.com/v1/publishers/google/models/\(encodedModel):streamGenerateContent"
-        let aiStudioBase = "https://generativelanguage.googleapis.com/v1beta/models/\(encodedModel):streamGenerateContent"
+        let vertexBase = "https://aiplatform.googleapis.com/v1/publishers/google/models/\(encodedModel):\(methodAction)"
+        let aiStudioBase = "https://generativelanguage.googleapis.com/v1beta/models/\(encodedModel):\(methodAction)"
 
         let candidateBases: [String]
         switch mode {
-        case .vertex:
-            candidateBases = [vertexBase]
-        case .aiStudio:
-            candidateBases = [aiStudioBase]
-        case .auto:
-            candidateBases = apiKey.hasPrefix("AQ.") ? [vertexBase, aiStudioBase] : [aiStudioBase, vertexBase]
+        case .vertex: candidateBases = [vertexBase]
+        case .aiStudio: candidateBases = [aiStudioBase]
+        case .auto: candidateBases = apiKey.hasPrefix("AQ.") ? [vertexBase, aiStudioBase] : [aiStudioBase, vertexBase]
         }
 
         let safeHistory = sanitizeAlternatingTurns(history)
         let contents: [[String: Any]] = safeHistory.map { turn in
             ["role": turn.isUser ? "user" : "model", "parts": [["text": turn.text]]]
         }
-        let bodyData = try JSONSerialization.data(withJSONObject: [
+
+        let fastBody = try JSONSerialization.data(withJSONObject: [
             "systemInstruction": ["parts": [["text": systemPrompt]]],
             "contents": contents,
-            "generationConfig": ["temperature": 0.2]
+            "generationConfig": [
+                "temperature": 0.2,
+                "maxOutputTokens": 2048,
+                "thinkingConfig": ["thinkingBudget": 0]
+            ]
         ] as [String: Any])
 
+        let plainBody = try JSONSerialization.data(withJSONObject: [
+            "systemInstruction": ["parts": [["text": systemPrompt]]],
+            "contents": contents,
+            "generationConfig": [
+                "temperature": 0.2,
+                "maxOutputTokens": 2048
+            ]
+        ] as [String: Any])
+
+        let bodies = [fastBody, plainBody]
         var lastError: Error?
 
-        for (index, baseStr) in candidateBases.enumerated() {
+        for (baseIdx, baseStr) in candidateBases.enumerated() {
             guard var comps = URLComponents(string: baseStr) else { continue }
-            comps.queryItems = [
-                URLQueryItem(name: "alt", value: "sse"),
-                URLQueryItem(name: "key", value: apiKey)
-            ]
+            var qItems = [URLQueryItem(name: "key", value: apiKey)]
+            if useStreaming { qItems.insert(URLQueryItem(name: "alt", value: "sse"), at: 0) }
+            comps.queryItems = qItems
             guard let url = comps.url else { continue }
 
-            var req = URLRequest(url: url)
-            req.httpMethod = "POST"
-            req.timeoutInterval = 120
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.httpBody = bodyData
+            for (bodyIdx, payload) in bodies.enumerated() {
+                var req = URLRequest(url: url)
+                req.httpMethod = "POST"
+                req.timeoutInterval = 30
+                req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                req.httpBody = payload
 
-            do {
-                let (bytes, response) = try await URLSession.shared.bytes(for: req)
-                try await validateStreamHTTP(response: response, bytes: bytes)
-
-                var accumulated = ""
-                for try await line in bytes.lines {
-                    if Task.isCancelled { break }
-                    guard line.hasPrefix("data:") else { continue }
-                    let jsonStr = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-                    guard !jsonStr.isEmpty, jsonStr != "[DONE]",
-                          let data = jsonStr.data(using: .utf8),
-                          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                          let candidates = json["candidates"] as? [[String: Any]],
-                          let content = candidates.first?["content"] as? [String: Any],
-                          let parts = content["parts"] as? [[String: Any]] else { continue }
-
-                    for part in parts {
-                        if (part["thought"] as? Bool) == true { continue }
-                        if let piece = part["text"] as? String, !piece.isEmpty {
-                            accumulated += piece
-                            await onChunk(piece)
+                do {
+                    if useStreaming {
+                        let (bytes, response) = try await URLSession.shared.bytes(for: req)
+                        try await validateStreamHTTP(response: response, bytes: bytes)
+                        var accumulated = ""
+                        for try await line in bytes.lines {
+                            if Task.isCancelled { break }
+                            guard line.hasPrefix("data:") else { continue }
+                            let jsonStr = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+                            guard !jsonStr.isEmpty, jsonStr != "[DONE]",
+                                  let data = jsonStr.data(using: .utf8),
+                                  let text = extractGeminiText(from: data), !text.isEmpty else { continue }
+                            accumulated += text
+                            await onChunk(text)
                         }
+                        if accumulated.isEmpty && !Task.isCancelled {
+                            throw NSError(domain: "AIClient", code: 500, userInfo: [NSLocalizedDescriptionKey: "Máy chủ không trả về dữ liệu."])
+                        }
+                        return accumulated
+                    } else {
+                        let (data, response) = try await URLSession.shared.data(for: req)
+                        try validateDataHTTP(response: response, data: data)
+                        let text = extractGeminiText(from: data) ?? ""
+                        if !text.isEmpty { await onChunk(text) }
+                        return text
                     }
+                } catch {
+                    lastError = error
+                    let code = (error as NSError).code
+                    if code == 400 && bodyIdx == 0 && !Task.isCancelled {
+                        continue
+                    }
+                    break
                 }
-                return accumulated
-            } catch {
-                lastError = error
-                let code = (error as NSError).code
-                let canFallback = (index + 1 < candidateBases.count) && (code == 403 || code == 401 || code == 404 || code == 400)
-                if canFallback && !Task.isCancelled {
-                    continue
-                }
-                throw enrichGeminiError(error)
             }
+
+            let code = (lastError as NSError?)?.code ?? 0
+            let canTryNextBase = (baseIdx + 1 < candidateBases.count) && (code == 403 || code == 401 || code == 404 || code == 400)
+            if canTryNextBase && !Task.isCancelled {
+                continue
+            }
+            break
         }
 
-        throw enrichGeminiError(lastError ?? NSError(domain: "AIClient", code: 500, userInfo: [NSLocalizedDescriptionKey: "Không kết nối được Google API."]))
+        throw enrichError(lastError ?? NSError(domain: "AIClient", code: 500, userInfo: [NSLocalizedDescriptionKey: "Không kết nối được Google API."]))
     }
 
-    private static func enrichGeminiError(_ error: Error) -> Error {
-        let ns = error as NSError
-        let msg = ns.localizedDescription
-        if ns.code == 403 && (msg.contains("aiplatform.googleapis.com") || msg.contains("PERMISSION_DENIED")) {
-            return NSError(
-                domain: "AIClient",
-                code: 403,
-                userInfo: [NSLocalizedDescriptionKey: "Dự án Google Cloud của key AQ. chưa bật Vertex AI API (aiplatform.googleapis.com). Hãy mở Google Cloud Console → bật Vertex AI API rồi chờ 1–2 phút thử lại.\n\nChi tiết: \(msg)"]
-            )
+    private static func extractGeminiText(from data: Data) -> String? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let candidates = json["candidates"] as? [[String: Any]],
+              let content = candidates.first?["content"] as? [String: Any],
+              let parts = content["parts"] as? [[String: Any]] else { return nil }
+        var out = ""
+        for part in parts {
+            if (part["thought"] as? Bool) == true { continue }
+            if let piece = part["text"] as? String { out += piece }
         }
-        return error
+        return out
     }
 
-    private static func streamClaude(
+    private static func callClaude(
         model: String,
         apiKey: String,
+        useStreaming: Bool,
         systemPrompt: String,
         history: [AIChatTurn],
         onChunk: @escaping @Sendable (String) async -> Void
@@ -1326,7 +1356,7 @@ enum AIClient {
         }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.timeoutInterval = 120
+        req.timeoutInterval = 35
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
         req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
@@ -1335,36 +1365,48 @@ enum AIClient {
         let messages: [[String: Any]] = safeHistory.map { ["role": $0.isUser ? "user" : "assistant", "content": $0.text] }
         let body: [String: Any] = [
             "model": model,
-            "max_tokens": 4096,
-            "stream": true,
+            "max_tokens": 2048,
+            "stream": useStreaming,
             "system": systemPrompt,
             "messages": messages
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (bytes, response) = try await URLSession.shared.bytes(for: req)
-        try await validateStreamHTTP(response: response, bytes: bytes)
-
-        var accumulated = ""
-        for try await line in bytes.lines {
-            if Task.isCancelled { break }
-            guard line.hasPrefix("data:") else { continue }
-            let jsonStr = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-            guard let data = jsonStr.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  (json["type"] as? String) == "content_block_delta",
-                  let delta = json["delta"] as? [String: Any],
-                  let piece = delta["text"] as? String, !piece.isEmpty else { continue }
-            accumulated += piece
-            await onChunk(piece)
+        if useStreaming {
+            let (bytes, response) = try await URLSession.shared.bytes(for: req)
+            try await validateStreamHTTP(response: response, bytes: bytes)
+            var accumulated = ""
+            for try await line in bytes.lines {
+                if Task.isCancelled { break }
+                guard line.hasPrefix("data:") else { continue }
+                let jsonStr = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+                guard let data = jsonStr.data(using: .utf8),
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      (json["type"] as? String) == "content_block_delta",
+                      let delta = json["delta"] as? [String: Any],
+                      let piece = delta["text"] as? String, !piece.isEmpty else { continue }
+                accumulated += piece
+                await onChunk(piece)
+            }
+            return accumulated
+        } else {
+            let (data, response) = try await URLSession.shared.data(for: req)
+            try validateDataHTTP(response: response, data: data)
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let content = json["content"] as? [[String: Any]] {
+                let text = content.compactMap { $0["text"] as? String }.joined()
+                if !text.isEmpty { await onChunk(text) }
+                return text
+            }
+            return ""
         }
-        return accumulated
     }
 
-    private static func streamOpenAI(
+    private static func callOpenAI(
         endpoint: String,
         model: String,
         apiKey: String,
+        useStreaming: Bool,
         systemPrompt: String,
         history: [AIChatTurn],
         onChunk: @escaping @Sendable (String) async -> Void
@@ -1374,7 +1416,7 @@ enum AIClient {
         }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.timeoutInterval = 120
+        req.timeoutInterval = 35
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
 
@@ -1384,30 +1426,121 @@ enum AIClient {
         }
         let body: [String: Any] = [
             "model": model,
-            "stream": true,
+            "stream": useStreaming,
             "messages": messages,
             "temperature": 0.2
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (bytes, response) = try await URLSession.shared.bytes(for: req)
-        try await validateStreamHTTP(response: response, bytes: bytes)
-
-        var accumulated = ""
-        for try await line in bytes.lines {
-            if Task.isCancelled { break }
-            guard line.hasPrefix("data:") else { continue }
-            let jsonStr = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-            guard !jsonStr.isEmpty, jsonStr != "[DONE]",
-                  let data = jsonStr.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let choices = json["choices"] as? [[String: Any]],
-                  let delta = choices.first?["delta"] as? [String: Any],
-                  let piece = delta["content"] as? String, !piece.isEmpty else { continue }
-            accumulated += piece
-            await onChunk(piece)
+        if useStreaming {
+            let (bytes, response) = try await URLSession.shared.bytes(for: req)
+            try await validateStreamHTTP(response: response, bytes: bytes)
+            var accumulated = ""
+            for try await line in bytes.lines {
+                if Task.isCancelled { break }
+                guard line.hasPrefix("data:") else { continue }
+                let jsonStr = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+                guard !jsonStr.isEmpty, jsonStr != "[DONE]",
+                      let data = jsonStr.data(using: .utf8),
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let choices = json["choices"] as? [[String: Any]],
+                      let delta = choices.first?["delta"] as? [String: Any],
+                      let piece = delta["content"] as? String, !piece.isEmpty else { continue }
+                accumulated += piece
+                await onChunk(piece)
+            }
+            return accumulated
+        } else {
+            let (data, response) = try await URLSession.shared.data(for: req)
+            try validateDataHTTP(response: response, data: data)
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let choices = json["choices"] as? [[String: Any]],
+               let msg = choices.first?["message"] as? [String: Any],
+               let text = msg["content"] as? String {
+                if !text.isEmpty { await onChunk(text) }
+                return text
+            }
+            return ""
         }
-        return accumulated
+    }
+
+    static func fetchModels(provider: AIProvider, apiKey: String, geminiMode: GeminiEndpointMode, customEndpoint: String) async throws -> [String] {
+        let cleanKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanKey.isEmpty else {
+            throw NSError(domain: "AIClient", code: 401, userInfo: [NSLocalizedDescriptionKey: "Hãy dán API Key trước khi quét danh sách model."])
+        }
+
+        if provider == .gemini {
+            let vertexBase = "https://aiplatform.googleapis.com/v1/publishers/google/models"
+            let aiStudioBase = "https://generativelanguage.googleapis.com/v1beta/models"
+            let bases: [String]
+            switch geminiMode {
+            case .vertex: bases = [vertexBase]
+            case .aiStudio: bases = [aiStudioBase]
+            case .auto: bases = cleanKey.hasPrefix("AQ.") ? [vertexBase, aiStudioBase] : [aiStudioBase, vertexBase]
+            }
+
+            var lastErr: Error?
+            for base in bases {
+                guard var comps = URLComponents(string: base) else { continue }
+                comps.queryItems = [URLQueryItem(name: "key", value: cleanKey)]
+                guard let url = comps.url else { continue }
+                do {
+                    var req = URLRequest(url: url)
+                    req.timeoutInterval = 18
+                    let (data, response) = try await URLSession.shared.data(for: req)
+                    try validateDataHTTP(response: response, data: data)
+                    if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let models = json["models"] as? [[String: Any]] {
+                        let names = models.compactMap { item -> String? in
+                            guard let raw = item["name"] as? String else { return nil }
+                            if let methods = item["supportedGenerationMethods"] as? [String],
+                               !methods.contains("generateContent") { return nil }
+                            return raw.components(separatedBy: "/").last
+                        }
+                        if !names.isEmpty { return names }
+                    }
+                } catch {
+                    lastErr = error
+                }
+            }
+            if let err = lastErr { throw enrichError(err) }
+            return provider.presetModels
+        }
+
+        let modelsEndpoint: String
+        switch provider {
+        case .openai: modelsEndpoint = "https://api.openai.com/v1/models"
+        case .groq: modelsEndpoint = "https://api.groq.com/openai/v1/models"
+        case .deepseek: modelsEndpoint = "https://api.deepseek.com/models"
+        case .grok: modelsEndpoint = "https://api.x.ai/v1/models"
+        case .openrouter: modelsEndpoint = "https://openrouter.ai/api/v1/models"
+        case .claude: modelsEndpoint = "https://api.anthropic.com/v1/models"
+        case .custom:
+            let base = customEndpoint.replacingOccurrences(of: "/chat/completions", with: "")
+            modelsEndpoint = base.hasSuffix("/") ? "\(base)models" : "\(base)/models"
+        case .gemini:
+            modelsEndpoint = ""
+        }
+
+        guard let url = URL(string: modelsEndpoint) else { return provider.presetModels }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 18
+        if provider == .claude {
+            req.setValue(cleanKey, forHTTPHeaderField: "x-api-key")
+            req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        } else {
+            req.setValue("Bearer \(cleanKey)", forHTTPHeaderField: "Authorization")
+        }
+
+        let (data, response) = try await URLSession.shared.data(for: req)
+        try validateDataHTTP(response: response, data: data)
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let list = json["data"] as? [[String: Any]] {
+            let ids = list.compactMap { $0["id"] as? String }.sorted()
+            if !ids.isEmpty { return ids }
+        }
+        return provider.presetModels
     }
 
     private static func validateStreamHTTP(response: URLResponse, bytes: URLSession.AsyncBytes) async throws {
@@ -1418,6 +1551,24 @@ enum AIClient {
             if errText.count > 460 { break }
         }
         throw NSError(domain: "AIClient", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "Lỗi API (\(http.statusCode)): \(errText)"])
+    }
+
+    private static func validateDataHTTP(response: URLResponse, data: Data) throws {
+        guard let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) else { return }
+        let errText = String(data: data, encoding: .utf8) ?? ""
+        throw NSError(domain: "AIClient", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "Lỗi API (\(http.statusCode)): \(String(errText.prefix(460)))"])
+    }
+
+    private static func enrichError(_ error: Error) -> Error {
+        let ns = error as NSError
+        let msg = ns.localizedDescription
+        if ns.code == NSURLErrorTimedOut {
+            return NSError(domain: "AIClient", code: ns.code, userInfo: [NSLocalizedDescriptionKey: "Quá thời gian phản hồi (30s). Hãy bấm Thử lại hoặc vào AI API tắt Streaming."])
+        }
+        if ns.code == 403 && (msg.contains("aiplatform.googleapis.com") || msg.contains("PERMISSION_DENIED")) {
+            return NSError(domain: "AIClient", code: 403, userInfo: [NSLocalizedDescriptionKey: "Dự án Google Cloud chưa bật Vertex AI API (aiplatform.googleapis.com). Hãy bật trong Google Cloud Console hoặc chuyển sang dùng OpenRouter.\n\nChi tiết: \(msg)"])
+        }
+        return error
     }
 }
 
@@ -1583,7 +1734,7 @@ enum AIPatchEngine {
     }
 }
 
-// MARK: - Studio Store Manager (v5.0)
+// MARK: - Studio Store Manager (v5.5)
 @MainActor
 final class IPAStudioManager: ObservableObject {
     @Published var summary: IPAWorkspaceSummary?
@@ -1592,6 +1743,7 @@ final class IPAStudioManager: ObservableObject {
     @Published var busyProgress: Double = 0
     @Published var busyDetail = ""
     @Published var alertMessage: String?
+    @Published var toast: ToastBannerData?
     @Published var changeLog: [String] = []
     @Published var pinnedFilesForAI: [String] = []
     @Published var scannedBinaryURLs: [String] = []
@@ -1614,6 +1766,9 @@ final class IPAStudioManager: ObservableObject {
     @Published var contextDepth: AIContextDepth = .fast {
         didSet { UserDefaults.standard.set(contextDepth.rawValue, forKey: depthKey) }
     }
+    @Published var useStreaming: Bool = true {
+        didSet { UserDefaults.standard.set(useStreaming, forKey: streamingKey) }
+    }
     @Published var apiKeys: [String: String] = [:] {
         didSet { UserDefaults.standard.set(apiKeys, forKey: keysStorageKey) }
     }
@@ -1625,17 +1780,24 @@ final class IPAStudioManager: ObservableObject {
     }
     @Published var messages: [AIMessage] = []
     @Published var isAIThinking = false
+    @Published var waitingSeconds = 0
 
     private var aiStreamTask: Task<Void, Never>?
+    private var waitTimerTask: Task<Void, Never>?
+    private var toastTask: Task<Void, Never>?
     private var lastUndoEntries: [UndoSnapshotEntry] = []
 
-    private let providerKey = "IPAStudio_v5_Provider"
-    private let modelKey = "IPAStudio_v5_Model"
-    private let geminiModeKey = "IPAStudio_v5_GeminiMode"
-    private let depthKey = "IPAStudio_v5_Depth"
-    private let keysStorageKey = "IPAStudio_v5_APIKeys"
+    private let providerKey = "IPAStudio_v55_Provider"
+    private let modelKey = "IPAStudio_v55_Model"
+    private let geminiModeKey = "IPAStudio_v55_GeminiMode"
+    private let depthKey = "IPAStudio_v55_Depth"
+    private let streamingKey = "IPAStudio_v55_Streaming"
+    private let keysStorageKey = "IPAStudio_v55_APIKeys"
     private let customEndpointKey = "IPAStudio_CustomEndpoint"
     private let compressKey = "IPAStudio_Compress"
+    private let lastSourceNameKey = "IPAStudio_v55_LastSource"
+    private let lastSourceSizeKey = "IPAStudio_v55_LastSize"
+    private let lastSourceSHAKey = "IPAStudio_v55_LastSHA"
 
     var documentsDir: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -1675,12 +1837,17 @@ final class IPAStudioManager: ObservableObject {
            let parsedD = AIContextDepth(rawValue: rawD) {
             contextDepth = parsedD
         }
+        if UserDefaults.standard.object(forKey: streamingKey) != nil {
+            useStreaming = UserDefaults.standard.bool(forKey: streamingKey)
+        }
         if let savedKeys = UserDefaults.standard.dictionary(forKey: keysStorageKey) as? [String: String] {
             apiKeys = savedKeys
-        } else if let legacyKeys = UserDefaults.standard.dictionary(forKey: "IPAStudio_v45_APIKeys") as? [String: String] {
+        } else if let legacyKeys = UserDefaults.standard.dictionary(forKey: "IPAStudio_v5_APIKeys") as? [String: String]
+                    ?? UserDefaults.standard.dictionary(forKey: "IPAStudio_v45_APIKeys") as? [String: String] {
             var migrated: [String: String] = [:]
             for (k, v) in legacyKeys {
                 if k.contains("Gemini") { migrated[AIProvider.gemini.rawValue] = v }
+                else if k.contains("OpenRouter") { migrated[AIProvider.openrouter.rawValue] = v }
                 else if k.contains("Groq") { migrated[AIProvider.groq.rawValue] = v }
                 else { migrated[k] = v }
             }
@@ -1689,6 +1856,22 @@ final class IPAStudioManager: ObservableObject {
         customEndpoint = UserDefaults.standard.string(forKey: customEndpointKey) ?? ""
         if UserDefaults.standard.object(forKey: compressKey) != nil {
             compressOnExport = UserDefaults.standard.bool(forKey: compressKey)
+        }
+
+        // Tự khôi phục IPA đang làm việc từ phiên trước
+        Task { await restoreExistingWorkspaceIfNeeded() }
+    }
+
+    func showToast(_ text: String, isError: Bool = false) {
+        toastTask?.cancel()
+        withAnimation(.snappy) {
+            toast = ToastBannerData(text: text, isError: isError)
+        }
+        toastTask = Task {
+            try? await Task.sleep(nanoseconds: 2_600_000_000)
+            if !Task.isCancelled {
+                withAnimation(.snappy) { self.toast = nil }
+            }
         }
     }
 
@@ -1700,6 +1883,20 @@ final class IPAStudioManager: ObservableObject {
         selectedProvider = provider
         if !provider.presetModels.contains(selectedModel) {
             selectedModel = provider.presetModels.first ?? ""
+        }
+    }
+
+    private func restoreExistingWorkspaceIfNeeded() async {
+        let root = workspaceDir
+        let payloadDir = root.appendingPathComponent("Payload")
+        guard FileManager.default.fileExists(atPath: payloadDir.path) else { return }
+        let srcName = UserDefaults.standard.string(forKey: lastSourceNameKey) ?? "Restored.ipa"
+        let origSize = Int64(UserDefaults.standard.integer(forKey: lastSourceSizeKey))
+        let sha = UserDefaults.standard.string(forKey: lastSourceSHAKey) ?? "N/A"
+        if let analyzed = try? await Task.detached(priority: .utility, operation: {
+            try Self.analyzeWorkspace(root: root, sourceName: srcName, originalSize: origSize, shaShort: sha)
+        }).value {
+            self.summary = analyzed
         }
     }
 
@@ -1742,13 +1939,14 @@ final class IPAStudioManager: ObservableObject {
         iconRefreshID = UUID()
         refreshWorkspace()
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        showToast("Đã hoàn tác thay đổi gần nhất")
     }
 
     // MARK: - Import & Analyze IPA
     func importIPA(from pickedURL: URL) {
         let ext = pickedURL.pathExtension.lowercased()
         guard ext == "ipa" || ext == "zip" else {
-            alertMessage = "Vui lòng chọn đúng file đuôi .ipa"
+            showToast("Vui lòng chọn đúng file đuôi .ipa", isError: true)
             return
         }
 
@@ -1779,6 +1977,10 @@ final class IPAStudioManager: ObservableObject {
                     try Self.analyzeWorkspace(root: destRoot, sourceName: sourceName, originalSize: originalSize, shaShort: sha)
                 }.value
 
+                UserDefaults.standard.set(sourceName, forKey: lastSourceNameKey)
+                UserDefaults.standard.set(Int(originalSize), forKey: lastSourceSizeKey)
+                UserDefaults.standard.set(sha, forKey: lastSourceSHAKey)
+
                 self.summary = analyzed
                 self.pinnedFilesForAI = []
                 self.scannedBinaryURLs = []
@@ -1790,6 +1992,7 @@ final class IPAStudioManager: ObservableObject {
                 self.changeLog = ["Đã mở gói: \(sourceName)"]
                 self.isBusy = false
                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                self.showToast("Đã mở \(analyzed.displayName)")
             } catch {
                 self.isBusy = false
                 self.alertMessage = error.localizedDescription
@@ -1919,7 +2122,7 @@ final class IPAStudioManager: ObservableObject {
         )
     }
 
-    // MARK: - v5.0 Mod Tools (Dylib Injection, Localization Cleaner, Icon, Clone, Bypass)
+    // MARK: - Mod Tools
     func injectDylibIntoBinary(dylibURL: URL, weakLoad: Bool) {
         guard let sum = summary else { return }
         let execURL = sum.appBundleURL.appendingPathComponent(sum.executableName)
@@ -1943,7 +2146,7 @@ final class IPAStudioManager: ObservableObject {
                 self.changeLog.insert("✓ \(msg)", at: 0)
                 self.refreshWorkspace()
                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                self.alertMessage = msg
+                self.showToast(msg)
             } catch {
                 self.isBusy = false
                 self.alertMessage = error.localizedDescription
@@ -1955,7 +2158,7 @@ final class IPAStudioManager: ObservableObject {
         guard let sum = summary else { return }
         let targets = LocalizationCleaner.removableURLs(in: sum.appBundleURL)
         guard !targets.isEmpty else {
-            alertMessage = "Không có gói ngôn ngữ thừa (.lproj) nào cần xóa."
+            showToast("Không có gói ngôn ngữ thừa (.lproj)")
             return
         }
         recordUndoSnapshot(for: targets)
@@ -1972,7 +2175,7 @@ final class IPAStudioManager: ObservableObject {
         changeLog.insert("✓ Đã xóa \(removedCount) gói ngôn ngữ (giảm \(freedStr))", at: 0)
         refreshWorkspace()
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-        alertMessage = "Đã dọn \(removedCount) thư mục .lproj (giữ lại Base, EN, VI), tiết kiệm \(freedStr)."
+        showToast("Đã dọn \(removedCount) .lproj (tiết kiệm \(freedStr))")
     }
 
     func applyManualEdits(name: String, bundleID: String, version: String, minOS: String, fileSharing: Bool, removeDeviceLimit: Bool) {
@@ -1993,6 +2196,7 @@ final class IPAStudioManager: ObservableObject {
             changeLog.insert("✓ Đã lưu Info.plist (\(name) • \(bundleID))", at: 0)
             refreshWorkspace()
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            showToast("Đã lưu Info.plist")
         } catch {
             alertMessage = "Lỗi lưu Info.plist: \(error.localizedDescription)"
         }
@@ -2008,6 +2212,7 @@ final class IPAStudioManager: ObservableObject {
                 changeLog.insert("✓ Đã xóa \(folderName)", at: 0)
                 refreshWorkspace()
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                showToast("Đã xóa \(folderName)")
             } catch {
                 alertMessage = "Không xóa được \(folderName): \(error.localizedDescription)"
             }
@@ -2038,6 +2243,7 @@ final class IPAStudioManager: ObservableObject {
         changeLog.insert("✓ \(note)", at: 0)
         refreshWorkspace()
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        showToast("Đã tối ưu Sideload xong")
     }
 
     func applyCloneSchemeFix() {
@@ -2067,6 +2273,7 @@ final class IPAStudioManager: ObservableObject {
             changeLog.insert("✓ Đã nhân bản Bundle ID & URL Schemes", at: 0)
             refreshWorkspace()
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            showToast("Đã nhân bản Bundle ID & URL Schemes")
         } catch {
             alertMessage = "Lỗi sửa Clone: \(error.localizedDescription)"
         }
@@ -2082,6 +2289,7 @@ final class IPAStudioManager: ObservableObject {
             changeLog.insert("✓ Đã giả lập phiên bản 99.9.9 (99999)", at: 0)
             refreshWorkspace()
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            showToast("Đã nâng phiên bản giả lập 99.9.9")
         } catch {
             alertMessage = "Lỗi sửa phiên bản: \(error.localizedDescription)"
         }
@@ -2095,7 +2303,7 @@ final class IPAStudioManager: ObservableObject {
             if count > 0 {
                 changeLog.insert("✓ Đã thay \(count) file AppIcon", at: 0)
                 refreshWorkspace()
-                alertMessage = "Đã tự động thu phóng và thay \(count) ảnh AppIcon trong gói IPA."
+                showToast("Đã thay \(count) ảnh AppIcon")
             } else {
                 alertMessage = "Không tìm thấy file AppIcon*.png trực tiếp trong .app (app có thể lưu icon trong Assets.car)."
             }
@@ -2208,6 +2416,7 @@ final class IPAStudioManager: ObservableObject {
         if added > 0 {
             changeLog.insert("✓ Đã chèn \(added) tệp vào \(targetDir.lastPathComponent)", at: 0)
             refreshWorkspace()
+            showToast("Đã chèn \(added) tệp")
         }
     }
 
@@ -2220,6 +2429,7 @@ final class IPAStudioManager: ObservableObject {
             iconRefreshID = UUID()
             refreshWorkspace()
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            showToast("Đã thay tệp thành công")
         } catch {
             alertMessage = "Lỗi thay tệp: \(error.localizedDescription)"
         }
@@ -2228,12 +2438,14 @@ final class IPAStudioManager: ObservableObject {
     func togglePinForAI(_ relativePath: String) {
         if let idx = pinnedFilesForAI.firstIndex(of: relativePath) {
             pinnedFilesForAI.remove(at: idx)
+            showToast("Đã bỏ ghim tệp khỏi AI")
         } else {
             pinnedFilesForAI.append(relativePath)
+            showToast("Đã ghim tệp cho AI")
         }
     }
 
-    // MARK: - AI Context Builder & Auto-Retry Streaming
+    // MARK: - AI Context Builder & Resilient Execution
     private func buildIPAContext() -> String {
         guard let sum = summary else {
             return "Hiện người dùng CHƯA nhập file IPA nào."
@@ -2289,7 +2501,7 @@ final class IPAStudioManager: ObservableObject {
 
     private func buildSystemPrompt() -> String {
         """
-        Bạn là chuyên gia iOS Reverse Engineering & IPA Modding trong TueeHub IPA Studio v5.0. Trả lời tiếng Việt ngắn gọn, kỹ thuật chuẩn xác.
+        Bạn là chuyên gia iOS Reverse Engineering & IPA Modding trong TueeHub IPA Studio v5.5. Trả lời tiếng Việt ngắn gọn, kỹ thuật chuẩn xác.
 
         Dữ liệu IPA hiện tại:
         \(buildIPAContext())
@@ -2316,43 +2528,57 @@ final class IPAStudioManager: ObservableObject {
         """
     }
 
-    func sendMessage(_ prompt: String) {
+    func sendMessage(_ prompt: String, appendUserBubble: Bool = true) {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !isAIThinking else { return }
 
-        messages.append(AIMessage(isUser: true, text: trimmed, modelBadge: nil, patch: nil))
+        if appendUserBubble {
+            messages.append(AIMessage(isUser: true, text: trimmed, modelBadge: nil, patch: nil))
+        }
 
         let provider = selectedProvider
-        let primaryModel = selectedModel
+        let activeModel = selectedModel
         let key = currentAPIKey
         let mode = geminiEndpointMode
         let endpoint = customEndpoint
+        let streaming = useStreaming
         let sysPrompt = buildSystemPrompt()
-        let history = messages.suffix(8).map { AIChatTurn(isUser: $0.isUser, text: $0.text) }
+        let history = messages.filter { $0.failedPrompt == nil }.suffix(8).map { AIChatTurn(isUser: $0.isUser, text: $0.text) }
 
         let placeholder = AIMessage(
             isUser: false,
             text: "",
-            modelBadge: "\(provider.rawValue) • \(primaryModel)",
+            modelBadge: "\(provider.rawValue) • \(activeModel)",
             patch: nil,
             isStreaming: true
         )
         let replyID = placeholder.id
         messages.append(placeholder)
         isAIThinking = true
+        waitingSeconds = 0
+
+        waitTimerTask?.cancel()
+        waitTimerTask = Task {
+            while !Task.isCancelled && self.isAIThinking {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if !Task.isCancelled && self.isAIThinking {
+                    self.waitingSeconds += 1
+                }
+            }
+        }
 
         aiStreamTask = Task {
-            var activeModel = primaryModel
             var attempt = 0
             while attempt < 2 {
                 attempt += 1
                 do {
-                    let fullReply = try await AIClient.stream(
+                    let fullReply = try await AIClient.send(
                         provider: provider,
                         model: activeModel,
                         apiKey: key,
                         geminiMode: mode,
                         customEndpoint: endpoint,
+                        useStreaming: streaming,
                         systemPrompt: sysPrompt,
                         history: history
                     ) { chunk in
@@ -2364,6 +2590,7 @@ final class IPAStudioManager: ObservableObject {
                     }
 
                     await MainActor.run {
+                        self.waitTimerTask?.cancel()
                         if let idx = self.messages.firstIndex(where: { $0.id == replyID }) {
                             self.messages[idx].isStreaming = false
                             let finalRaw = fullReply.isEmpty ? self.messages[idx].text : fullReply
@@ -2377,25 +2604,25 @@ final class IPAStudioManager: ObservableObject {
                     return
                 } catch {
                     let nsErr = error as NSError
-                    let isOverloaded = (nsErr.code == 503 || nsErr.code == 429)
-                    if provider == .gemini && isOverloaded && attempt == 1 && !Task.isCancelled {
-                        let fallbackModel = "gemini-3.8-flash-lite"
-                        activeModel = fallbackModel
+                    let isTempBusy = (nsErr.code == 503 || nsErr.code == 429)
+                    if isTempBusy && attempt == 1 && !Task.isCancelled {
                         await MainActor.run {
                             if let idx = self.messages.firstIndex(where: { $0.id == replyID }) {
                                 self.messages[idx].text = ""
-                                self.messages[idx].modelBadge = "Auto-Fallback 503 → \(fallbackModel)"
+                                self.messages[idx].modelBadge = "Đang thử lại (503) • \(activeModel)"
                             }
                         }
-                        try? await Task.sleep(nanoseconds: 900_000_000)
+                        try? await Task.sleep(nanoseconds: 1_400_000_000)
                         continue
                     }
 
                     await MainActor.run {
+                        self.waitTimerTask?.cancel()
                         if let idx = self.messages.firstIndex(where: { $0.id == replyID }) {
                             self.messages[idx].isStreaming = false
                             if !Task.isCancelled {
                                 self.messages[idx].text = "❌ \(error.localizedDescription)"
+                                self.messages[idx].failedPrompt = trimmed
                             } else if self.messages[idx].text.isEmpty {
                                 self.messages[idx].text = "Đã dừng."
                             }
@@ -2408,9 +2635,18 @@ final class IPAStudioManager: ObservableObject {
         }
     }
 
+    func retryFailedMessage(id: UUID) {
+        guard let idx = messages.firstIndex(where: { $0.id == id }),
+              let prompt = messages[idx].failedPrompt else { return }
+        messages.remove(at: idx)
+        sendMessage(prompt, appendUserBubble: false)
+    }
+
     func stopAI() {
         aiStreamTask?.cancel()
         aiStreamTask = nil
+        waitTimerTask?.cancel()
+        waitTimerTask = nil
         isAIThinking = false
         for i in messages.indices where messages[i].isStreaming {
             messages[i].isStreaming = false
@@ -2430,12 +2666,13 @@ final class IPAStudioManager: ObservableObject {
         for l in logs.reversed() { changeLog.insert(l, at: 0) }
         refreshWorkspace()
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-        alertMessage = logs.joined(separator: "\n")
+        showToast("Đã áp dụng \(patch.actions.count) thay đổi vào IPA")
     }
 
     func clearWorkspace() {
         try? FileManager.default.removeItem(at: workspaceDir)
         try? FileManager.default.removeItem(at: undoBackupDir)
+        UserDefaults.standard.removeObject(forKey: lastSourceNameKey)
         summary = nil
         pinnedFilesForAI = []
         scannedBinaryURLs = []
@@ -2444,6 +2681,7 @@ final class IPAStudioManager: ObservableObject {
         lastUndoEntries = []
         canUndo = false
         changeLog = []
+        showToast("Đã đóng workspace")
     }
 }
 
@@ -2495,7 +2733,25 @@ struct ContentView: View {
                 .transition(.opacity)
             }
         }
+        .overlay(alignment: .top) {
+            if let toast = store.toast {
+                HStack(spacing: 8) {
+                    Image(systemName: toast.isError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                        .foregroundStyle(toast.isError ? .red : .green)
+                    Text(toast.text)
+                        .font(.caption.weight(.semibold))
+                        .lineLimit(2)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .glassEffect(.regular.tint((toast.isError ? Color.red : Color.green).opacity(0.18)), in: .capsule)
+                .padding(.top, 8)
+                .padding(.horizontal, 20)
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
         .animation(.snappy, value: store.isBusy)
+        .animation(.snappy, value: store.toast)
         .alert("TueeHub IPA Studio", isPresented: Binding(
             get: { store.alertMessage != nil },
             set: { if !$0 { store.alertMessage = nil } }
@@ -2507,7 +2763,7 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Tab 1: IPA Overview, Mach-O Inspector & v5.0 Mod Tools
+// MARK: - Tab 1: IPA Overview, Mach-O Inspector & Mod Tools
 struct IPAOverviewTab: View {
     @ObservedObject var store: IPAStudioManager
 
@@ -2519,12 +2775,14 @@ struct IPAOverviewTab: View {
     @State private var removeDeviceLimit = false
     @State private var showDylibInjectDialog = false
 
+    private let iconShape = RoundedRectangle(cornerRadius: 16, style: .continuous)
+
     var body: some View {
         NavigationStack {
             Group {
                 if let sum = store.summary {
                     List {
-                        // Hero Card
+                        // Hero Card với bo góc continuous chuẩn Apple
                         Section {
                             VStack(spacing: 16) {
                                 HStack(spacing: 14) {
@@ -2532,18 +2790,19 @@ struct IPAOverviewTab: View {
                                         Image(uiImage: img)
                                             .resizable()
                                             .scaledToFill()
-                                            .frame(width: 64, height: 64)
-                                            .clipShape(ConcentricRectangle())
+                                            .frame(width: 66, height: 66)
+                                            .clipShape(iconShape)
+                                            .overlay(iconShape.strokeBorder(Color.primary.opacity(0.1), lineWidth: 0.6))
                                             .id(store.iconRefreshID)
                                     } else {
                                         Image(systemName: "app.dashed")
                                             .font(.title)
                                             .foregroundStyle(.secondary)
-                                            .frame(width: 64, height: 64)
-                                            .background(Color(uiColor: .tertiarySystemFill), in: ConcentricRectangle())
+                                            .frame(width: 66, height: 66)
+                                            .background(Color(uiColor: .tertiarySystemFill), in: iconShape)
                                     }
 
-                                    VStack(alignment: .leading, spacing: 4) {
+                                    VStack(alignment: .leading, spacing: 5) {
                                         Text(sum.displayName)
                                             .font(.title3.weight(.semibold))
                                             .lineLimit(1)
@@ -2555,17 +2814,17 @@ struct IPAOverviewTab: View {
                                         HStack(spacing: 6) {
                                             Text("v\(sum.version)")
                                                 .font(.caption2.weight(.semibold))
-                                                .padding(.horizontal, 8)
+                                                .padding(.horizontal, 9)
                                                 .padding(.vertical, 3)
-                                                .background(Color.accentColor.opacity(0.16), in: .capsule)
+                                                .background(Color.accentColor.opacity(0.18), in: Capsule())
                                                 .foregroundStyle(.tint)
 
                                             if let enc = sum.machO?.isEncrypted {
                                                 Text(enc ? "FairPlay Mã hóa" : "Đã giải mã")
                                                     .font(.caption2.weight(.semibold))
-                                                    .padding(.horizontal, 8)
+                                                    .padding(.horizontal, 9)
                                                     .padding(.vertical, 3)
-                                                    .background((enc ? Color.red : Color.green).opacity(0.16), in: .capsule)
+                                                    .background((enc ? Color.red : Color.green).opacity(0.18), in: Capsule())
                                                     .foregroundStyle(enc ? .red : .green)
                                             }
                                         }
@@ -2573,24 +2832,30 @@ struct IPAOverviewTab: View {
                                     Spacer(minLength: 0)
                                 }
 
-                                HStack(spacing: 8) {
-                                    QuickStatTile(title: "Tệp", value: "\(sum.totalFilesCount)")
-                                    QuickStatTile(title: "Kiến trúc", value: sum.machO?.architectures.first ?? "N/A")
-                                    QuickStatTile(title: "Dylib nhúng", value: "\(sum.machO?.injectedDylibs.count ?? 0)")
+                                HStack(spacing: 10) {
+                                    QuickStatTile(icon: "doc.on.doc", title: "Tệp", value: "\(sum.totalFilesCount)")
+                                    QuickStatTile(icon: "cpu", title: "Kiến trúc", value: sum.machO?.architectures.first ?? "N/A")
+                                    QuickStatTile(icon: "puzzlepiece.extension", title: "Dylib nhúng", value: "\(sum.machO?.injectedDylibs.count ?? 0)")
                                 }
 
                                 Button {
                                     store.exportEditedIPA()
                                 } label: {
-                                    Label("Đóng gói & Xuất IPA", systemImage: "square.and.arrow.up")
-                                        .font(.headline)
-                                        .frame(maxWidth: .infinity)
+                                    HStack(spacing: 8) {
+                                        Image(systemName: "square.and.arrow.up")
+                                            .font(.body.weight(.semibold))
+                                        Text("Đóng gói & Xuất IPA")
+                                            .font(.headline)
+                                    }
+                                    .foregroundStyle(.white)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 2)
                                 }
                                 .buttonStyle(.glassProminent)
+                                .buttonBorderShape(.capsule)
                                 .controlSize(.large)
                             }
-                            .padding(.vertical, 4)
-                            .containerShape(.rect(cornerRadius: 22))
+                            .padding(.vertical, 6)
                         }
 
                         // Mach-O, Dylibs & Entitlements
@@ -2645,8 +2910,8 @@ struct IPAOverviewTab: View {
                             }
                         }
 
-                        // Công cụ Mod v5.0
-                        Section("Công cụ v5.0") {
+                        // Công cụ Mod v5.5
+                        Section("Công cụ Mod") {
                             Button {
                                 showDylibInjectDialog = true
                             } label: {
@@ -2743,7 +3008,7 @@ struct IPAOverviewTab: View {
                     }
                 } else {
                     ContentUnavailableView {
-                        Label("IPA Studio v5", systemImage: "shippingbox.and.arrow.backward")
+                        Label("IPA Studio", systemImage: "shippingbox.and.arrow.backward")
                     } description: {
                         Text("Nhập file .ipa từ app Tệp để bắt đầu.")
                     } actions: {
@@ -2753,8 +3018,10 @@ struct IPAOverviewTab: View {
                             }
                         } label: {
                             Label("Nhập file .IPA", systemImage: "plus")
+                                .foregroundStyle(.white)
                         }
                         .buttonStyle(.glassProminent)
+                        .buttonBorderShape(.capsule)
                         .controlSize(.large)
                     }
                 }
@@ -2808,6 +3075,36 @@ struct IPAOverviewTab: View {
     }
 }
 
+struct QuickStatTile: View {
+    let icon: String
+    let title: String
+    let value: String
+
+    private let tileShape = RoundedRectangle(cornerRadius: 14, style: .continuous)
+
+    var body: some View {
+        VStack(spacing: 4) {
+            Text(value)
+                .font(.subheadline.weight(.semibold).monospaced())
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+            HStack(spacing: 3) {
+                Image(systemName: icon)
+                    .font(.caption2)
+                Text(title)
+                    .font(.caption2)
+            }
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 10)
+        .padding(.horizontal, 6)
+        .background(Color(uiColor: .tertiarySystemFill), in: tileShape)
+        .overlay(tileShape.strokeBorder(Color.primary.opacity(0.06), lineWidth: 0.5))
+    }
+}
+
 struct EntitlementsViewer: View {
     @ObservedObject var store: IPAStudioManager
     let xml: String?
@@ -2820,6 +3117,7 @@ struct EntitlementsViewer: View {
                         Toggle("Gửi Entitlements này cho AI", isOn: $store.includeEntitlementsInAI)
                         Button {
                             UIPasteboard.general.string = xml
+                            store.showToast("Đã copy Entitlements XML")
                         } label: {
                             Label("Sao chép toàn bộ XML", systemImage: "doc.on.doc")
                         }
@@ -2881,6 +3179,7 @@ struct BinaryURLScannerView: View {
                             .contextMenu {
                                 Button {
                                     UIPasteboard.general.string = url
+                                    store.showToast("Đã copy URL")
                                 } label: {
                                     Label("Copy URL", systemImage: "doc.on.doc")
                                 }
@@ -2896,25 +3195,6 @@ struct BinaryURLScannerView: View {
                 store.scanBinaryStrings()
             }
         }
-    }
-}
-
-struct QuickStatTile: View {
-    let title: String
-    let value: String
-
-    var body: some View {
-        VStack(spacing: 3) {
-            Text(value)
-                .font(.subheadline.weight(.semibold).monospaced())
-                .lineLimit(1)
-            Text(title)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 9)
-        .background(Color(uiColor: .tertiarySystemFill), in: ConcentricRectangle())
     }
 }
 
@@ -2972,7 +3252,7 @@ struct DylibListView: View {
     }
 }
 
-// MARK: - Tab 2: AI Studio (Minimalist Clean Liquid Glass — Không nút gợi ý rườm rà)
+// MARK: - Tab 2: AI Studio (Minimalist Clean Liquid Glass + Live Timer & Retry)
 struct AIStudioTab: View {
     @ObservedObject var store: IPAStudioManager
     @State private var inputText = ""
@@ -2987,7 +3267,7 @@ struct AIStudioTab: View {
                         ContentUnavailableView(
                             "AI Studio",
                             systemImage: "sparkles",
-                            description: Text(store.summary == nil ? "Nhập một file .ipa hoặc bắt đầu đặt câu hỏi." : "Đang kết nối với \(store.summary?.displayName ?? "IPA").")
+                            description: Text(store.summary == nil ? "Nhập một file .ipa hoặc đặt câu hỏi." : "Đang gắn với \(store.summary?.displayName ?? "IPA").")
                         )
                     } else {
                         ScrollView {
@@ -2995,8 +3275,14 @@ struct AIStudioTab: View {
                                 ForEach(store.messages) { msg in
                                     AIMessageBubble(
                                         message: msg,
+                                        waitingSeconds: store.waitingSeconds,
                                         canApplyPatch: store.summary != nil,
-                                        onApply: { store.applyAIPatch(messageID: msg.id) }
+                                        onApply: { store.applyAIPatch(messageID: msg.id) },
+                                        onRetry: { store.retryFailedMessage(id: msg.id) },
+                                        onCopy: {
+                                            UIPasteboard.general.string = msg.text
+                                            store.showToast("Đã sao chép")
+                                        }
                                     )
                                     .id(msg.id)
                                 }
@@ -3091,6 +3377,7 @@ struct AIStudioTab: View {
                                 } label: {
                                     Image(systemName: "stop.fill")
                                         .font(.body.weight(.semibold))
+                                        .foregroundStyle(.white)
                                         .frame(width: 24, height: 24)
                                 }
                                 .buttonStyle(.glassProminent)
@@ -3108,6 +3395,7 @@ struct AIStudioTab: View {
                                 } label: {
                                     Image(systemName: "arrow.up")
                                         .font(.body.weight(.semibold))
+                                        .foregroundStyle(.white)
                                         .frame(width: 24, height: 24)
                                 }
                                 .buttonStyle(.glassProminent)
@@ -3167,8 +3455,14 @@ struct AIStudioTab: View {
 
 struct AIMessageBubble: View {
     let message: AIMessage
+    let waitingSeconds: Int
     let canApplyPatch: Bool
     let onApply: () -> Void
+    let onRetry: () -> Void
+    let onCopy: () -> Void
+
+    private let bubbleShape = RoundedRectangle(cornerRadius: 20, style: .continuous)
+    private let patchShape = RoundedRectangle(cornerRadius: 20, style: .continuous)
 
     var body: some View {
         VStack(alignment: message.isUser ? .trailing : .leading, spacing: 8) {
@@ -3187,7 +3481,7 @@ struct AIMessageBubble: View {
                 if message.text.isEmpty && message.isStreaming {
                     HStack(spacing: 8) {
                         ProgressView().controlSize(.small)
-                        Text("Đang kết nối...")
+                        Text(waitingSeconds > 0 ? "Đang kết nối... (\(waitingSeconds)s)" : "Đang kết nối...")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                     }
@@ -3201,14 +3495,30 @@ struct AIMessageBubble: View {
             .padding(.vertical, 11)
             .background(
                 message.isUser ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Color(uiColor: .secondarySystemGroupedBackground)),
-                in: .rect(cornerRadius: 20)
+                in: bubbleShape
             )
             .foregroundStyle(message.isUser ? Color.white : Color.primary)
             .contextMenu {
-                Button {
-                    UIPasteboard.general.string = message.text
-                } label: {
+                Button(action: onCopy) {
                     Label("Sao chép nội dung", systemImage: "doc.on.doc")
+                }
+            }
+
+            if message.failedPrompt != nil {
+                HStack(spacing: 8) {
+                    Button(action: onRetry) {
+                        Label("Thử lại", systemImage: "arrow.clockwise")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .buttonStyle(.glass)
+                    .controlSize(.small)
+
+                    Button(action: onCopy) {
+                        Label("Copy lỗi", systemImage: "doc.on.doc")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .buttonStyle(.glass)
+                    .controlSize(.small)
                 }
             }
 
@@ -3238,15 +3548,16 @@ struct AIMessageBubble: View {
                             systemImage: message.patchApplied ? "checkmark.circle.fill" : "bolt.fill"
                         )
                         .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white)
                         .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.glassProminent)
+                    .buttonBorderShape(.capsule)
                     .tint(message.patchApplied ? .green : .accentColor)
                     .disabled(!canApplyPatch || message.patchApplied)
                 }
                 .padding(14)
-                .background(Color(uiColor: .secondarySystemGroupedBackground), in: .rect(cornerRadius: 22))
-                .containerShape(.rect(cornerRadius: 22))
+                .background(Color(uiColor: .secondarySystemGroupedBackground), in: patchShape)
             }
         }
         .frame(maxWidth: .infinity, alignment: message.isUser ? .trailing : .leading)
@@ -3257,6 +3568,13 @@ struct AIModelSelectorSheet: View {
     @ObservedObject var store: IPAStudioManager
     @Environment(\.dismiss) private var dismiss
     @State private var customModelInput = ""
+    @State private var fetchedModels: [String] = []
+    @State private var isFetching = false
+    @State private var fetchError: String?
+
+    var displayedModels: [String] {
+        fetchedModels.isEmpty ? store.selectedProvider.presetModels : fetchedModels
+    }
 
     var body: some View {
         NavigationStack {
@@ -3265,6 +3583,8 @@ struct AIModelSelectorSheet: View {
                     ForEach(AIProvider.allCases) { provider in
                         Button {
                             store.switchProvider(provider)
+                            fetchedModels = []
+                            fetchError = nil
                         } label: {
                             HStack {
                                 Label(provider.rawValue, systemImage: provider.icon)
@@ -3284,8 +3604,52 @@ struct AIModelSelectorSheet: View {
                     }
                 }
 
-                Section("2. Model (\(store.selectedProvider.rawValue))") {
-                    ForEach(store.selectedProvider.presetModels, id: \.self) { m in
+                Section("2. API Key cho \(store.selectedProvider.rawValue)") {
+                    SecureField(
+                        store.selectedProvider.keyPlaceholder,
+                        text: Binding(
+                            get: { store.apiKeys[store.selectedProvider.rawValue] ?? "" },
+                            set: { store.setAPIKey($0, for: store.selectedProvider) }
+                        )
+                    )
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+
+                    if store.selectedProvider == .gemini {
+                        Picker("Cổng kết nối", selection: $store.geminiEndpointMode) {
+                            ForEach(GeminiEndpointMode.allCases) { m in
+                                Text(m.rawValue).tag(m)
+                            }
+                        }
+                    }
+
+                    if store.selectedProvider == .custom {
+                        TextField("https://.../v1/chat/completions", text: $store.customEndpoint)
+                            .font(.caption.monospaced())
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                    }
+
+                    Button {
+                        loadLiveModels()
+                    } label: {
+                        HStack {
+                            Label(isFetching ? "Đang quét model từ Key..." : "Quét danh sách Model thật từ Key", systemImage: "arrow.clockwise")
+                            Spacer()
+                            if isFetching { ProgressView() }
+                        }
+                    }
+                    .disabled(isFetching || store.currentAPIKey.isEmpty)
+
+                    if let err = fetchError {
+                        Text(err)
+                            .font(.caption2)
+                            .foregroundStyle(.red)
+                    }
+                }
+
+                Section("3. Chọn Model (\(displayedModels.count))") {
+                    ForEach(displayedModels, id: \.self) { m in
                         Button {
                             store.selectedModel = m
                         } label: {
@@ -3319,33 +3683,6 @@ struct AIModelSelectorSheet: View {
                         .disabled(customModelInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
                 }
-
-                Section("3. API Key cho \(store.selectedProvider.rawValue)") {
-                    SecureField(
-                        store.selectedProvider.keyPlaceholder,
-                        text: Binding(
-                            get: { store.apiKeys[store.selectedProvider.rawValue] ?? "" },
-                            set: { store.setAPIKey($0, for: store.selectedProvider) }
-                        )
-                    )
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-
-                    if store.selectedProvider == .gemini {
-                        Picker("Cổng kết nối", selection: $store.geminiEndpointMode) {
-                            ForEach(GeminiEndpointMode.allCases) { m in
-                                Text(m.rawValue).tag(m)
-                            }
-                        }
-                    }
-
-                    if store.selectedProvider == .custom {
-                        TextField("https://.../v1/chat/completions", text: $store.customEndpoint)
-                            .font(.caption.monospaced())
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                    }
-                }
             }
             .navigationTitle("Chọn Model & API")
             .navigationBarTitleDisplayMode(.inline)
@@ -3353,6 +3690,29 @@ struct AIModelSelectorSheet: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Xong") { dismiss() }
                 }
+            }
+        }
+    }
+
+    private func loadLiveModels() {
+        isFetching = true
+        fetchError = nil
+        let provider = store.selectedProvider
+        let key = store.currentAPIKey
+        let mode = store.geminiEndpointMode
+        let endpoint = store.customEndpoint
+
+        Task {
+            do {
+                let list = try await AIClient.fetchModels(provider: provider, apiKey: key, geminiMode: mode, customEndpoint: endpoint)
+                self.fetchedModels = list
+                if !list.contains(store.selectedModel), let first = list.first {
+                    store.selectedModel = first
+                }
+                self.isFetching = false
+            } catch {
+                self.fetchError = error.localizedDescription
+                self.isFetching = false
             }
         }
     }
@@ -3487,7 +3847,8 @@ struct FileDetailEditorView: View {
     @State private var hexPreview = ""
     @State private var previewImage: UIImage?
     @State private var isPlist = false
-    @State private var saveNotice: String?
+
+    private let previewShape = RoundedRectangle(cornerRadius: 20, style: .continuous)
 
     var isPinned: Bool {
         store.pinnedFilesForAI.contains(node.relativePath)
@@ -3508,7 +3869,8 @@ struct FileDetailEditorView: View {
                                 .resizable()
                                 .scaledToFit()
                                 .frame(maxHeight: 320)
-                                .clipShape(ConcentricRectangle())
+                                .clipShape(previewShape)
+                                .overlay(previewShape.strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.6))
                                 .padding(.top, 20)
                             Text("\(Int(img.size.width * img.scale)) × \(Int(img.size.height * img.scale)) px • \(node.formattedSize)")
                                 .font(.caption.monospaced())
@@ -3519,21 +3881,19 @@ struct FileDetailEditorView: View {
                                 if let picked = urls.first {
                                     store.replaceFile(at: node.url, with: picked, relativePath: node.relativePath)
                                     previewImage = UIImage(contentsOfFile: node.url.path)
-                                    withAnimation(.snappy) {
-                                        saveNotice = "✓ Đã thay ảnh thành công"
-                                    }
                                 }
                             }
                         } label: {
                             Label("Thay ảnh này từ Tệp", systemImage: "photo.badge.arrow.down")
                                 .font(.headline)
+                                .foregroundStyle(.white)
                         }
                         .buttonStyle(.glassProminent)
+                        .buttonBorderShape(.capsule)
                         .controlSize(.large)
                     }
                     .frame(maxWidth: .infinity)
                     .padding()
-                    .containerShape(.rect(cornerRadius: 24))
                 }
             } else {
                 ScrollView {
@@ -3548,27 +3908,6 @@ struct FileDetailEditorView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding()
                 }
-            }
-        }
-        .safeAreaInset(edge: .top) {
-            if let notice = saveNotice {
-                let isError = notice.contains("Lỗi")
-                HStack(spacing: 8) {
-                    Text(notice)
-                        .font(.caption.weight(.semibold))
-                    Button {
-                        withAnimation(.snappy) { saveNotice = nil }
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.caption2.weight(.semibold))
-                    }
-                    .buttonStyle(.plain)
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                .glassEffect(.regular.tint((isError ? Color.red : Color.green).opacity(0.25)), in: .capsule)
-                .padding(.top, 6)
-                .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
         .navigationTitle(node.name)
@@ -3635,13 +3974,9 @@ struct FileDetailEditorView: View {
             }
             store.changeLog.insert("✓ Đã sửa thủ công: \(node.relativePath)", at: 0)
             store.refreshWorkspace()
-            withAnimation(.snappy) {
-                saveNotice = "✓ Đã lưu tệp thành công"
-            }
+            store.showToast("Đã lưu \(node.name)")
         } catch {
-            withAnimation(.snappy) {
-                saveNotice = "Lỗi cú pháp/lưu tệp: \(error.localizedDescription)"
-            }
+            store.showToast("Lỗi lưu tệp: \(error.localizedDescription)", isError: true)
         }
     }
 }
@@ -3661,6 +3996,7 @@ struct APISettingsTab: View {
                             Text(d.rawValue).tag(d)
                         }
                     }
+                    Toggle("Streaming hiện chữ trực tiếp", isOn: $store.useStreaming)
                     if store.selectedProvider == .gemini {
                         Picker("Cổng Gemini", selection: $store.geminiEndpointMode) {
                             ForEach(GeminiEndpointMode.allCases) { m in
