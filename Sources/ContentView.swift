@@ -9,6 +9,7 @@ import Compression
 import CryptoKit
 import Observation
 import CoreTransferable
+import PhotosUI
 
 // MARK: - Keychain Secure Storage (No Plain-Text Persistence, Never Logs Keys)
 enum KeychainStore: Sendable {
@@ -193,6 +194,19 @@ struct ChatAttachment: Identifiable, Hashable, Sendable {
         case .archive: return .purple
         case .unsupported: return .secondary
         }
+    }
+
+    /// Đuôi tệp viết hoa siêu gọn cho badge (PDF, DOCX, XLSX, ZIP, SWIFT...)
+    var badgeText: String {
+        let ext = fileExtension.trimmingCharacters(in: .whitespacesAndNewlines)
+        if ext.isEmpty { return "FILE" }
+        return String(ext.uppercased().prefix(5))
+    }
+
+    /// Mô tả ngắn (đã bỏ phần chi tiết trong ngoặc) dùng cho thẻ đính kèm, VD "PDF 8 trang"
+    var shortNote: String {
+        let head = summaryNote.components(separatedBy: " (").first ?? summaryNote
+        return head.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     static func == (lhs: ChatAttachment, rhs: ChatAttachment) -> Bool {
@@ -507,13 +521,29 @@ enum AttachmentProcessor {
         }.value
     }
 
-    static func processImage(_ image: UIImage, suggestedName: String = "Image.jpg") async throws -> ChatAttachment {
+    /// Xử lý ảnh thô (Data) từ PhotosPicker / kéo thả: giải mã, resize, tạo thumbnail và ghi cache
+    /// hoàn toàn trong `Task.detached` — chỉ truyền `Data` (Sendable) xuyên ranh giới luồng, không truyền `UIImage`.
+    static func processImageData(_ data: Data, suggestedName: String = "Photo.jpg") async throws -> ChatAttachment {
         try await Task.detached(priority: .userInitiated) {
+            if Int64(data.count) > maxFileSizeBytes {
+                throw AttachmentError.fileTooLarge(name: suggestedName, limitMB: Int(maxFileSizeBytes / (1024 * 1024)))
+            }
+            try Task.checkCancellation()
+
+            guard let image = UIImage(data: data) else {
+                throw AttachmentError.unreadable(name: suggestedName, reason: "Dữ liệu ảnh bị hỏng.")
+            }
+
             let id = UUID()
             let jpeg = downscaleToJPEG(image: image, maxSide: 1600, quality: 0.78)
             let thumb = downscaleToJPEG(image: image, maxSide: 160, quality: 0.72)
+            guard !jpeg.isEmpty else {
+                throw AttachmentError.unreadable(name: suggestedName, reason: "Không mã hóa được ảnh JPEG.")
+            }
+
             let safeDest = cacheDirectory.appendingPathComponent("\(id.uuidString)_\(suggestedName)")
             try jpeg.write(to: safeDest, options: .atomic)
+
             let pxW = Int(image.size.width * image.scale)
             let pxH = Int(image.size.height * image.scale)
             return ChatAttachment(
@@ -529,6 +559,16 @@ enum AttachmentProcessor {
                 summaryNote: "Ảnh \(pxW)×\(pxH) px"
             )
         }.value
+    }
+
+    /// Giữ API cũ cho ảnh `UIImage` (kéo thả...). `UIImage` được mã hóa thành `Data` ngay tại Main Actor
+    /// rồi mới đẩy xuống `processImageData`, nên không có `UIImage` nào đi xuyên `Task.detached`.
+    @MainActor
+    static func processImage(_ image: UIImage, suggestedName: String = "Image.jpg") async throws -> ChatAttachment {
+        guard let data = image.jpegData(compressionQuality: 0.95) ?? image.pngData() else {
+            throw AttachmentError.unreadable(name: suggestedName, reason: "Không mã hóa được ảnh.")
+        }
+        return try await processImageData(data, suggestedName: suggestedName)
     }
 
     // MARK: - Helpers
@@ -1998,9 +2038,14 @@ enum AIPatchEngine {
 
 // MARK: - Native UIKit File Picker & Share Helper
 @MainActor
-final class NativeFilePicker: NSObject, UIDocumentPickerDelegate {
+final class NativeFilePicker: NSObject, UIDocumentPickerDelegate, UIAdaptivePresentationControllerDelegate {
     static let shared = NativeFilePicker()
+
     private var completion: (([URL]) -> Void)?
+    private weak var activePicker: UIDocumentPickerViewController?
+    private var queuedAllowsMultiple = false
+    private var queuedTypes: [UTType]?
+    private var isPresentationPending = false
 
     static var supportedTypes: [UTType] {
         var list: [UTType] = [.item, .data, .content, .archive, .zip, .json, .propertyList, .plainText, .image, .png, .jpeg]
@@ -2010,23 +2055,78 @@ final class NativeFilePicker: NSObject, UIDocumentPickerDelegate {
         return list
     }
 
+    /// Hạ bàn phím đang mở (an toàn khi gọi bất cứ lúc nào, kể cả khi không có ô nhập nào đang focus).
+    static func dismissKeyboard() {
+        _ = UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+    }
+
+    /// Picker của chính mình còn đang hiển thị (kiểm tra theo trạng thái UIKit thật, không dùng cờ Bool dễ bị lệch).
+    private var isPickerOnScreen: Bool {
+        guard let picker = activePicker else { return false }
+        return picker.presentingViewController != nil || picker.isBeingPresented
+    }
+
     func pick(allowsMultiple: Bool = false, types: [UTType]? = nil, completion: @escaping ([URL]) -> Void) {
+        // 1. Luôn hạ bàn phím trước khi mở picker
+        Self.dismissKeyboard()
+
+        // 2. Đã có picker đang mở / đang chờ present → không chồng thêm picker thứ hai (nguyên nhân gây đơ nút Open)
+        guard !isPickerOnScreen, !isPresentationPending else { return }
+
+        self.completion = completion
+        queuedAllowsMultiple = allowsMultiple
+        queuedTypes = types
+        isPresentationPending = true
+        attemptPresent(retriesLeft: 8)
+    }
+
+    private func attemptPresent(retriesLeft: Int) {
         guard let presenter = Self.topViewController() else {
-            completion([])
+            let handler = completion
+            completion = nil
+            isPresentationPending = false
+            handler?([])
             return
         }
-        self.completion = completion
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: types ?? Self.supportedTypes, asCopy: true)
+
+        // 3. ViewController trên cùng đang present/dismiss dở (sheet, dialog, bàn phím...) → đợi xong rồi mới present
+        if Self.isTransitioning(presenter) {
+            guard retriesLeft > 0 else {
+                completion = nil
+                isPresentationPending = false
+                return
+            }
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .milliseconds(150))
+                self?.attemptPresent(retriesLeft: retriesLeft - 1)
+            }
+            return
+        }
+
+        let picker = UIDocumentPickerViewController(
+            forOpeningContentTypes: queuedTypes ?? Self.supportedTypes,
+            asCopy: true
+        )
         picker.delegate = self
-        picker.allowsMultipleSelection = allowsMultiple
+        picker.allowsMultipleSelection = queuedAllowsMultiple
         picker.shouldShowFileExtensions = true
+        picker.modalPresentationStyle = .formSheet
+        picker.presentationController?.delegate = self
+
+        activePicker = picker
+        isPresentationPending = false
         presenter.present(picker, animated: true)
+    }
+
+    private static func isTransitioning(_ vc: UIViewController) -> Bool {
+        vc.isBeingPresented || vc.isBeingDismissed || vc.isMovingToParent || vc.isMovingFromParent || vc is UIAlertController
     }
 
     nonisolated func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
         Task { @MainActor in
             let handler = self.completion
             self.completion = nil
+            self.isPresentationPending = false
             handler?(urls)
         }
     }
@@ -2034,6 +2134,15 @@ final class NativeFilePicker: NSObject, UIDocumentPickerDelegate {
     nonisolated func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
         Task { @MainActor in
             self.completion = nil
+            self.isPresentationPending = false
+        }
+    }
+
+    /// Người dùng vuốt xuống để đóng picker → reset trạng thái để lần sau vẫn bấm mở bình thường.
+    nonisolated func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+        Task { @MainActor in
+            self.completion = nil
+            self.isPresentationPending = false
         }
     }
 
@@ -4345,6 +4454,9 @@ final class AIChatStore {
     @ObservationIgnored private var aiStreamTask: Task<Void, Never>?
     @ObservationIgnored private var waitTimerTask: Task<Void, Never>?
     @ObservationIgnored private var attachmentTask: Task<Void, Never>?
+    @ObservationIgnored private var importGeneration = 0
+    @ObservationIgnored private var queuedAttachmentSlots = 0
+    @ObservationIgnored private var activeImportJobs = 0
 
     init(workspace: IPAWorkspaceStore, config: APIConfigStore) {
         self.workspace = workspace
@@ -4357,77 +4469,278 @@ final class AIChatStore {
         }
     }
 
-    // MARK: - Attachments Import (FileImporter / Drag-Drop / OpenURL)
-    func importAttachments(from urls: [URL]) {
-        guard !urls.isEmpty else { return }
-        attachmentTask?.cancel()
+    // MARK: - Attachments Import (NativeFilePicker / PhotosPicker / Drag-Drop / OpenURL)
+    /// Số tệp tối đa được đính kèm cho mỗi tin nhắn.
+    static let maxPendingAttachments = 10
+
+    private struct SlotReservation {
+        let accepted: Int
+        let wasTrimmed: Bool
+    }
+
+    /// Giữ chỗ trong khay (tối đa `maxPendingAttachments`), đã tính cả các tệp đang xếp hàng xử lý.
+    /// Nếu vượt quá, chỉ nhận đủ phần còn trống và hiện toast thân thiện.
+    private func reserveAttachmentSlots(requested: Int) -> SlotReservation {
+        let free = max(0, Self.maxPendingAttachments - pendingAttachments.count - queuedAttachmentSlots)
+        let accepted = min(requested, free)
+        let trimmed = accepted < requested
+        if trimmed {
+            Haptics.light()
+            workspace.showToast("Tối đa \(Self.maxPendingAttachments) tệp mỗi lần gửi", isError: true)
+        }
+        queuedAttachmentSlots += accepted
+        return SlotReservation(accepted: accepted, wasTrimmed: trimmed)
+    }
+
+    /// Đánh dấu bắt đầu một đợt import (cộng dồn, không hủy đợt đang chạy). Trả về "thế hệ" hiện tại của khay.
+    private func beginImportJob(status: String) -> Int {
+        activeImportJobs += 1
+        isProcessingAttachments = true
+        if attachmentStatus.isEmpty {
+            attachmentProgress = 0.05
+            attachmentStatus = status
+        }
+        return importGeneration
+    }
+
+    private func startImportJobUI(generation: Int, status: String) {
+        guard generation == importGeneration else { return }
         isProcessingAttachments = true
         attachmentProgress = 0.05
-        attachmentStatus = "Đang đọc \(urls.count) tệp..."
+        attachmentStatus = status
+    }
+
+    private func setImportProgress(_ value: Double, _ note: String, generation: Int) {
+        guard isProcessingAttachments, generation == importGeneration else { return }
+        attachmentProgress = min(max(value, 0), 1)
+        attachmentStatus = note
+    }
+
+    /// Kết thúc xử lý 1 tệp: nhả chỗ đã giữ và (nếu khay vẫn còn hợp lệ) cộng dồn vào `pendingAttachments`.
+    private func settleImportedFile(_ attachment: ChatAttachment?, generation: Int) -> Bool {
+        let isCurrent = generation == importGeneration
+        if isCurrent {
+            queuedAttachmentSlots = max(0, queuedAttachmentSlots - 1)
+        }
+        guard let attachment else { return false }
+        guard isCurrent, pendingAttachments.count < Self.maxPendingAttachments else {
+            try? FileManager.default.removeItem(at: attachment.localURL)
+            return false
+        }
+        pendingAttachments.append(attachment)
+        return true
+    }
+
+    private func finishImportJob(
+        generation: Int,
+        unsettled: Int,
+        added: Int,
+        wasTrimmed: Bool,
+        noun: String,
+        lastError: String?
+    ) {
+        let isCurrent = generation == importGeneration
+        if isCurrent {
+            queuedAttachmentSlots = max(0, queuedAttachmentSlots - unsettled)
+        }
+
+        activeImportJobs = max(0, activeImportJobs - 1)
+        if activeImportJobs == 0 {
+            isProcessingAttachments = false
+            attachmentProgress = 0
+            attachmentStatus = ""
+        }
+
+        guard isCurrent else { return }
+        if let lastError {
+            Haptics.error()
+            workspace.alertMessage = lastError
+        } else if added > 0 {
+            Haptics.light()
+            let base = "Đã đính kèm \(added) \(noun)"
+            workspace.showToast(wasTrimmed ? "\(base) • Tối đa \(Self.maxPendingAttachments) tệp mỗi lần gửi" : base)
+        }
+    }
+
+    /// Import tệp từ URL. Mỗi đợt được xếp hàng nối tiếp đợt trước và cộng dồn vào khay;
+    /// việc đọc/giải mã chạy hoàn toàn trong `Task.detached` nên không chặn người dùng gõ chữ.
+    func importAttachments(from urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        let reservation = reserveAttachmentSlots(requested: urls.count)
+        guard reservation.accepted > 0 else { return }
+
+        let batch = Array(urls.prefix(reservation.accepted))
+        let wasTrimmed = reservation.wasTrimmed
+        let statusText = "Đang đọc \(batch.count) tệp..."
+        let generation = beginImportJob(status: statusText)
+        let previous = attachmentTask
 
         attachmentTask = Task { [weak self] in
+            await previous?.value
             guard let self else { return }
+            self.startImportJobUI(generation: generation, status: statusText)
+
             var addedCount = 0
+            var settledCount = 0
             var lastError: String?
 
-            for (idx, url) in urls.enumerated() {
-                if Task.isCancelled { break }
-                let baseStep = Double(idx) / Double(urls.count)
-                let stepSpan = 1.0 / Double(urls.count)
+            for (idx, url) in batch.enumerated() {
+                if Task.isCancelled || generation != self.importGeneration { break }
+                let baseStep = Double(idx) / Double(batch.count)
+                let stepSpan = 1.0 / Double(batch.count)
 
                 do {
                     let attachment = try await AttachmentProcessor.process(sourceURL: url) { p, note in
                         Task { @MainActor [weak self] in
-                            self?.attachmentProgress = baseStep + p * stepSpan
-                            self?.attachmentStatus = note
+                            self?.setImportProgress(baseStep + p * stepSpan, note, generation: generation)
                         }
                     }
-                    self.pendingAttachments.append(attachment)
-                    addedCount += 1
+                    settledCount += 1
+                    if self.settleImportedFile(attachment, generation: generation) {
+                        addedCount += 1
+                    }
                 } catch {
+                    settledCount += 1
+                    _ = self.settleImportedFile(nil, generation: generation)
                     if !(error is CancellationError) {
                         lastError = error.localizedDescription
                     }
                 }
             }
 
-            self.isProcessingAttachments = false
-            self.attachmentProgress = 0
-            self.attachmentStatus = ""
+            self.finishImportJob(
+                generation: generation,
+                unsettled: batch.count - settledCount,
+                added: addedCount,
+                wasTrimmed: wasTrimmed,
+                noun: "tệp",
+                lastError: lastError
+            )
+        }
+    }
 
-            if let err = lastError {
-                Haptics.error()
-                self.workspace.alertMessage = err
-            } else if addedCount > 0 {
-                Haptics.light()
-                self.workspace.showToast("Đã đính kèm \(addedCount) tệp")
+    /// Import nhiều ảnh từ `PhotosPicker`: tải từng ảnh bất đồng bộ dưới dạng `Data`,
+    /// rồi giải mã/resize/tạo thumbnail trong `Task.detached` (chỉ truyền `Data`, không truyền `UIImage`).
+    func importPhotoPickerItems(_ items: [PhotosPickerItem]) {
+        guard !items.isEmpty else { return }
+        let reservation = reserveAttachmentSlots(requested: items.count)
+        guard reservation.accepted > 0 else { return }
+
+        let batch = Array(items.prefix(reservation.accepted))
+        let wasTrimmed = reservation.wasTrimmed
+        let statusText = "Đang tải \(batch.count) ảnh..."
+        let generation = beginImportJob(status: statusText)
+        let previous = attachmentTask
+
+        attachmentTask = Task { [weak self] in
+            await previous?.value
+            guard let self else { return }
+            self.startImportJobUI(generation: generation, status: statusText)
+
+            var addedCount = 0
+            var settledCount = 0
+            var lastError: String?
+
+            for (idx, item) in batch.enumerated() {
+                if Task.isCancelled || generation != self.importGeneration { break }
+                let baseStep = Double(idx) / Double(batch.count)
+                let stepSpan = 1.0 / Double(batch.count)
+                let label = "\(idx + 1)/\(batch.count)"
+
+                do {
+                    self.setImportProgress(baseStep + stepSpan * 0.1, "Đang tải ảnh \(label)...", generation: generation)
+                    guard let data = try await item.loadTransferable(type: Data.self) else {
+                        throw AttachmentError.unreadable(
+                            name: "Ảnh \(idx + 1)",
+                            reason: "Không tải được dữ liệu ảnh từ thư viện."
+                        )
+                    }
+                    try Task.checkCancellation()
+
+                    self.setImportProgress(baseStep + stepSpan * 0.5, "Đang tối ưu ảnh \(label)...", generation: generation)
+                    let attachment = try await AttachmentProcessor.processImageData(
+                        data,
+                        suggestedName: "Photo_\(idx + 1).jpg"
+                    )
+                    self.setImportProgress(baseStep + stepSpan, "Hoàn tất ảnh \(label)", generation: generation)
+
+                    settledCount += 1
+                    if self.settleImportedFile(attachment, generation: generation) {
+                        addedCount += 1
+                    }
+                } catch {
+                    settledCount += 1
+                    _ = self.settleImportedFile(nil, generation: generation)
+                    if !(error is CancellationError) {
+                        lastError = error.localizedDescription
+                    }
+                }
             }
+
+            self.finishImportJob(
+                generation: generation,
+                unsettled: batch.count - settledCount,
+                added: addedCount,
+                wasTrimmed: wasTrimmed,
+                noun: "ảnh",
+                lastError: lastError
+            )
         }
     }
 
     func importDroppedImage(_ image: UIImage, suggestedName: String = "DroppedImage.jpg") {
-        isProcessingAttachments = true
-        attachmentProgress = 0.4
-        attachmentStatus = "Đang xử lý ảnh..."
-        Task { [weak self] in
+        let reservation = reserveAttachmentSlots(requested: 1)
+        guard reservation.accepted > 0 else { return }
+
+        let statusText = "Đang xử lý ảnh..."
+        let generation = beginImportJob(status: statusText)
+        let previous = attachmentTask
+
+        attachmentTask = Task { [weak self] in
+            await previous?.value
             guard let self else { return }
+            self.startImportJobUI(generation: generation, status: statusText)
+
+            var added = 0
+            var lastError: String?
             do {
                 let att = try await AttachmentProcessor.processImage(image, suggestedName: suggestedName)
-                self.pendingAttachments.append(att)
-                Haptics.light()
-                self.workspace.showToast("Đã đính kèm ảnh")
+                if self.settleImportedFile(att, generation: generation) {
+                    added = 1
+                }
             } catch {
-                Haptics.error()
-                self.workspace.alertMessage = error.localizedDescription
+                _ = self.settleImportedFile(nil, generation: generation)
+                if !(error is CancellationError) {
+                    lastError = error.localizedDescription
+                }
             }
-            self.isProcessingAttachments = false
-            self.attachmentProgress = 0
-            self.attachmentStatus = ""
+
+            self.finishImportJob(
+                generation: generation,
+                unsettled: 0,
+                added: added,
+                wasTrimmed: false,
+                noun: "ảnh",
+                lastError: lastError
+            )
         }
     }
 
     func removePendingAttachment(id: UUID) {
         pendingAttachments.removeAll { $0.id == id }
+        Haptics.light()
+    }
+
+    /// Xóa nhanh toàn bộ khay đính kèm (kể cả các đợt đang xử lý dở) kèm haptic nhẹ.
+    func clearPendingAttachments() {
+        guard !pendingAttachments.isEmpty || isProcessingAttachments else { return }
+        importGeneration += 1
+        queuedAttachmentSlots = 0
+        attachmentTask?.cancel()
+        isProcessingAttachments = false
+        attachmentProgress = 0
+        attachmentStatus = ""
+        pendingAttachments.removeAll()
         Haptics.light()
     }
 
@@ -4678,7 +4991,8 @@ struct AIStudioTab: View {
     let chat: AIChatStore
 
     @State private var showModelPicker = false
-    @State private var showFileImporter = false
+    @State private var showPhotoPicker = false
+    @State private var selectedPhotoItems: [PhotosPickerItem] = []
     @State private var isDropTargeted = false
     @Namespace private var glassNamespace
 
@@ -4697,8 +5011,7 @@ struct AIStudioTab: View {
                             )
                         } actions: {
                             Button {
-                                Haptics.light()
-                                showFileImporter = true
+                                openFilePicker()
                             } label: {
                                 Label("Đính kèm tệp", systemImage: "paperclip")
                             }
@@ -4781,10 +5094,8 @@ struct AIStudioTab: View {
                     AIStudioComposerBar(
                         chat: chat,
                         glassNamespace: glassNamespace,
-                        onOpenFileImporter: {
-                            Haptics.light()
-                            showFileImporter = true
-                        }
+                        onPickFiles: { openFilePicker() },
+                        onPickPhotos: { openPhotoPicker() }
                     )
                 }
             }
@@ -4824,18 +5135,17 @@ struct AIStudioTab: View {
                     .accessibilityLabel("Chọn model AI")
                 }
             }
-            .fileImporter(
-                isPresented: $showFileImporter,
-                allowedContentTypes: [.item],
-                allowsMultipleSelection: true
-            ) { result in
-                switch result {
-                case .success(let urls):
-                    chat.importAttachments(from: urls)
-                case .failure(let error):
-                    Haptics.error()
-                    workspace.showToast("Không mở được tệp: \(error.localizedDescription)", isError: true)
-                }
+            // PhotosPicker gắn ở View ngoài (không nằm trong Menu / safeAreaInset) để luôn hiện ổn định trên iOS
+            .photosPicker(
+                isPresented: $showPhotoPicker,
+                selection: $selectedPhotoItems,
+                maxSelectionCount: AIChatStore.maxPendingAttachments,
+                matching: .images
+            )
+            .onChange(of: selectedPhotoItems) { _, newItems in
+                guard !newItems.isEmpty else { return }
+                chat.importPhotoPickerItems(newItems)
+                selectedPhotoItems = []
             }
             .sheet(isPresented: $showModelPicker) {
                 AIModelSelectorSheet(config: config)
@@ -4844,6 +5154,28 @@ struct AIStudioTab: View {
                 QuickLookPreviewSheet(url: item.url)
                     .ignoresSafeArea()
             }
+        }
+    }
+
+    // MARK: - Attachment Launchers (hạ bàn phím → đợi ~100ms → mở picker, tránh xung đột animation gây đơ nút Open)
+    private func openFilePicker() {
+        Haptics.light()
+        NativeFilePicker.dismissKeyboard()
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(100))
+            NativeFilePicker.shared.pick(allowsMultiple: true, types: [.item]) { urls in
+                guard !urls.isEmpty else { return }
+                chat.importAttachments(from: urls)
+            }
+        }
+    }
+
+    private func openPhotoPicker() {
+        Haptics.light()
+        NativeFilePicker.dismissKeyboard()
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(100))
+            showPhotoPicker = true
         }
     }
 }
@@ -4932,7 +5264,8 @@ private struct AIStudioHeaderBar: View {
 private struct AIStudioComposerBar: View {
     let chat: AIChatStore
     let glassNamespace: Namespace.ID
-    let onOpenFileImporter: () -> Void
+    let onPickFiles: () -> Void
+    let onPickPhotos: () -> Void
 
     @State private var inputText = ""
 
@@ -4940,57 +5273,43 @@ private struct AIStudioComposerBar: View {
         !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !chat.pendingAttachments.isEmpty
     }
 
+    private var isTrayVisible: Bool {
+        !chat.pendingAttachments.isEmpty || chat.isProcessingAttachments
+    }
+
     var body: some View {
         VStack(spacing: 8) {
-            if chat.isProcessingAttachments {
-                HStack(spacing: 10) {
-                    ProgressView(value: chat.attachmentProgress)
-                        .progressViewStyle(.linear)
-                        .frame(width: 90)
-                    Text(chat.attachmentStatus)
-                        .font(.caption2.weight(.medium))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                    Spacer(minLength: 0)
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                .glassEffect(.regular, in: .capsule)
-                .padding(.horizontal, 16)
-                .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
-
-            if !chat.pendingAttachments.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(chat.pendingAttachments) { item in
-                            AttachmentChipView(
-                                attachment: item,
-                                onTap: { chat.openQuickLook(url: item.localURL) },
-                                onRemove: {
-                                    withAnimation(.snappy) {
-                                        chat.removePendingAttachment(id: item.id)
-                                    }
-                                }
-                            )
-                        }
-                    }
-                    .padding(.horizontal, 16)
-                }
-                .transition(.move(edge: .bottom).combined(with: .opacity))
+            if isTrayVisible {
+                AIAttachmentTray(chat: chat)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
             }
 
             GlassEffectContainer(spacing: 8) {
                 HStack(alignment: .bottom, spacing: 8) {
-                    Button(action: onOpenFileImporter) {
+                    // Menu Liquid Glass: PhotosPicker KHÔNG nằm trong Menu, chỉ bật cờ để View ngoài (AIStudioTab) present
+                    Menu {
+                        Button {
+                            onPickFiles()
+                        } label: {
+                            Label("Chọn nhiều tệp", systemImage: "doc.badge.plus")
+                        }
+
+                        Button {
+                            onPickPhotos()
+                        } label: {
+                            Label("Chọn nhiều ảnh", systemImage: "photo.on.rectangle.angled")
+                        }
+                    } label: {
                         Image(systemName: "plus")
                             .font(.body.weight(.semibold))
                             .frame(width: 24, height: 24)
                     }
+                    .menuStyle(.button)
+                    .menuIndicator(.hidden)
                     .buttonStyle(.glass)
                     .buttonBorderShape(.circle)
                     .glassEffectID("attachButton", in: glassNamespace)
-                    .accessibilityLabel("Đính kèm tệp")
+                    .accessibilityLabel("Đính kèm tệp hoặc ảnh")
 
                     TextField("Nhập yêu cầu...", text: $inputText, axis: .vertical)
                         .lineLimit(1...4)
@@ -5039,63 +5358,337 @@ private struct AIStudioComposerBar: View {
                 .padding(.vertical, 8)
             }
         }
-        .animation(.snappy, value: chat.isProcessingAttachments)
+        .animation(.snappy, value: isTrayVisible)
         .animation(.snappy, value: chat.pendingAttachments.count)
     }
 }
 
-// MARK: - Attachment Chip (Hỗ trợ nhấn để xem QuickLook)
-private struct AttachmentChipView: View {
+// MARK: - Attachment Tray (Liquid Glass v6) — khay đính kèm nằm ngay phía trên thanh nhập chữ
+private struct AIAttachmentTray: View {
+    let chat: AIChatStore
+
+    var body: some View {
+        VStack(spacing: 6) {
+            if chat.isProcessingAttachments {
+                AttachmentProgressCapsule(
+                    progress: chat.attachmentProgress,
+                    status: chat.attachmentStatus
+                )
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+
+            if chat.pendingAttachments.count >= 2 {
+                HStack(spacing: 8) {
+                    Text("Đã đính kèm \(chat.pendingAttachments.count)/\(AIChatStore.maxPendingAttachments) tệp")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .contentTransition(.numericText())
+
+                    Spacer(minLength: 8)
+
+                    Button {
+                        withAnimation(.snappy) {
+                            chat.clearPendingAttachments()
+                        }
+                    } label: {
+                        Text("Xóa hết")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Xóa hết tệp đính kèm")
+                }
+                .padding(.horizontal, 20)
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+
+            if !chat.pendingAttachments.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    LazyHStack(spacing: 10) {
+                        ForEach(chat.pendingAttachments) { item in
+                            AttachmentCardView(
+                                attachment: item,
+                                isCompact: false,
+                                onTap: {
+                                    Haptics.light()
+                                    chat.openQuickLook(url: item.localURL)
+                                },
+                                onRemove: {
+                                    withAnimation(.snappy) {
+                                        chat.removePendingAttachment(id: item.id)
+                                    }
+                                }
+                            )
+                            .transition(.scale(scale: 0.85).combined(with: .opacity))
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 4)
+                }
+                .scrollClipDisabled()
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.snappy, value: chat.isProcessingAttachments)
+        .animation(.snappy, value: chat.pendingAttachments.map(\.id))
+    }
+}
+
+// MARK: - Progress Capsule (Liquid Glass) hiển thị tiến trình xử lý tệp
+private struct AttachmentProgressCapsule: View {
+    let progress: Double
+    let status: String
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ProgressView(value: min(max(progress, 0), 1))
+                .progressViewStyle(.linear)
+                .frame(width: 90)
+                .animation(.easeOut(duration: 0.2), value: progress)
+            Text(status)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .glassEffect(.regular, in: .capsule)
+        .padding(.horizontal, 16)
+    }
+}
+
+// MARK: - Attachment Cards (chạm để mở QuickLook) — dùng chung cho khay đính kèm và bong bóng tin nhắn
+private struct AttachmentCardView: View {
     let attachment: ChatAttachment
+    let isCompact: Bool
     let onTap: () -> Void
     var onRemove: (() -> Void)? = nil
 
-    private let thumbShape = RoundedRectangle(cornerRadius: 8, style: .continuous)
+    var body: some View {
+        if attachment.kind == .image {
+            AttachmentImageCard(
+                attachment: attachment,
+                side: isCompact ? 72 : 68,
+                cornerRadius: isCompact ? 14 : 16,
+                onTap: onTap,
+                onRemove: onRemove
+            )
+        } else {
+            AttachmentFileCard(
+                attachment: attachment,
+                isCompact: isCompact,
+                onTap: onTap,
+                onRemove: onRemove
+            )
+        }
+    }
+}
+
+private struct AttachmentImageCard: View {
+    let attachment: ChatAttachment
+    let side: CGFloat
+    let cornerRadius: CGFloat
+    let onTap: () -> Void
+    var onRemove: (() -> Void)? = nil
+
+    private var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+    }
 
     var body: some View {
-        HStack(spacing: 8) {
+        ZStack(alignment: .topTrailing) {
             Button(action: onTap) {
-                HStack(spacing: 7) {
-                    if let thumbData = attachment.imageThumbnailData, let uiImg = UIImage(data: thumbData) {
-                        Image(uiImage: uiImg)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: 28, height: 28)
-                            .clipShape(thumbShape)
-                    } else {
-                        Image(systemName: attachment.systemImage)
-                            .font(.subheadline)
-                            .foregroundStyle(attachment.tintColor)
-                            .frame(width: 24, height: 24)
+                thumbnail
+                    .frame(width: side, height: side)
+                    .clipShape(shape)
+                    .overlay {
+                        shape.strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
                     }
+                    .overlay(alignment: .bottomLeading) {
+                        sizeBadge
+                    }
+                    .contentShape(shape)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Xem ảnh \(attachment.fileName)")
 
-                    VStack(alignment: .leading, spacing: 1) {
+            if let onRemove {
+                AttachmentRemoveButton(
+                    onDark: true,
+                    accessibilityText: "Gỡ ảnh \(attachment.fileName)",
+                    action: onRemove
+                )
+                .offset(x: 9, y: -9)
+            }
+        }
+        .frame(width: side, height: side)
+    }
+
+    @ViewBuilder
+    private var thumbnail: some View {
+        if let data = attachment.imageThumbnailData, let uiImage = UIImage(data: data) {
+            Image(uiImage: uiImage)
+                .resizable()
+                .scaledToFill()
+        } else {
+            ZStack {
+                attachment.tintColor.opacity(0.16)
+                Image(systemName: attachment.systemImage)
+                    .font(.title3)
+                    .foregroundStyle(attachment.tintColor)
+            }
+        }
+    }
+
+    private var sizeBadge: some View {
+        Text(attachment.formattedSize)
+            .font(.system(size: 9, weight: .semibold, design: .rounded))
+            .foregroundStyle(.white)
+            .lineLimit(1)
+            .minimumScaleFactor(0.8)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(.ultraThinMaterial, in: Capsule())
+            .background(Color.black.opacity(0.35), in: Capsule())
+            .environment(\.colorScheme, .dark)
+            .padding(4)
+    }
+}
+
+private struct AttachmentFileCard: View {
+    let attachment: ChatAttachment
+    let isCompact: Bool
+    let onTap: () -> Void
+    var onRemove: (() -> Void)? = nil
+
+    private var cardWidth: CGFloat { isCompact ? 164 : 176 }
+    private var cardHeight: CGFloat { isCompact ? 60 : 68 }
+    private var cardRadius: CGFloat { isCompact ? 14 : 16 }
+    private var tileSize: CGFloat { isCompact ? 38 : 42 }
+    private var tileRadius: CGFloat { isCompact ? 10 : 11 }
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            Button(action: onTap) {
+                HStack(spacing: 10) {
+                    iconTile
+
+                    VStack(alignment: .leading, spacing: 2) {
                         Text(attachment.fileName)
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.primary)
                             .lineLimit(1)
-                            .frame(maxWidth: 145, alignment: .leading)
-                        Text(attachment.formattedSize)
-                            .font(.caption2.monospaced())
+                            .truncationMode(.middle)
+                        Text("\(attachment.formattedSize) • \(attachment.shortNote)")
+                            .font(.caption2)
                             .foregroundStyle(.secondary)
+                            .lineLimit(1)
                     }
+
+                    Spacer(minLength: 0)
                 }
+                .padding(.horizontal, 12)
+                .frame(width: cardWidth, height: cardHeight, alignment: .leading)
+                .glassEffect(.regular.interactive(), in: .rect(cornerRadius: cardRadius))
+                .contentShape(RoundedRectangle(cornerRadius: cardRadius, style: .continuous))
             }
             .buttonStyle(.plain)
+            .accessibilityLabel("Xem tệp \(attachment.fileName)")
 
             if let onRemove {
-                Button(action: onRemove) {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Gỡ tệp \(attachment.fileName)")
+                AttachmentRemoveButton(
+                    onDark: false,
+                    accessibilityText: "Gỡ tệp \(attachment.fileName)",
+                    action: onRemove
+                )
+                .offset(x: 9, y: -9)
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
-        .glassEffect(.regular.interactive(), in: .capsule)
+        .frame(width: cardWidth, height: cardHeight)
+    }
+
+    private var iconTile: some View {
+        RoundedRectangle(cornerRadius: tileRadius, style: .continuous)
+            .fill(attachment.tintColor.opacity(0.16))
+            .frame(width: tileSize, height: tileSize)
+            .overlay {
+                VStack(spacing: 1) {
+                    Image(systemName: attachment.systemImage)
+                        .font(.system(size: isCompact ? 14 : 16, weight: .semibold))
+                        .foregroundStyle(attachment.tintColor)
+                    Text(attachment.badgeText)
+                        .font(.system(size: 8, weight: .heavy, design: .rounded))
+                        .foregroundStyle(attachment.tintColor)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                }
+                .padding(.horizontal, 2)
+            }
+    }
+}
+
+/// Nút × tròn nhỏ (20×20) để gỡ từng tệp; vùng chạm rộng hơn vùng hiển thị cho dễ bấm.
+private struct AttachmentRemoveButton: View {
+    let onDark: Bool
+    let accessibilityText: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            icon
+                .padding(5)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(accessibilityText)
+    }
+
+    @ViewBuilder
+    private var icon: some View {
+        if onDark {
+            Image(systemName: "xmark")
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(.white)
+                .frame(width: 20, height: 20)
+                .background(Color.black.opacity(0.55), in: Circle())
+                .overlay {
+                    Circle().strokeBorder(Color.white.opacity(0.25), lineWidth: 0.5)
+                }
+        } else {
+            Image(systemName: "xmark")
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(.primary)
+                .frame(width: 20, height: 20)
+                .glassEffect(.regular.interactive(), in: .circle)
+        }
+    }
+}
+
+// MARK: - Attachment Strip trong bong bóng tin nhắn (không có nút ×, bấm để mở QuickLook)
+private struct AttachmentBubbleStrip: View {
+    let attachments: [ChatAttachment]
+    let onPreview: (URL) -> Void
+
+    private var row: some View {
+        HStack(spacing: 8) {
+            ForEach(attachments) { att in
+                AttachmentCardView(
+                    attachment: att,
+                    isCompact: true,
+                    onTap: { onPreview(att.localURL) }
+                )
+            }
+        }
+    }
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            row
+            ScrollView(.horizontal, showsIndicators: false) {
+                row
+            }
+        }
     }
 }
 
@@ -5125,16 +5718,10 @@ struct AIMessageBubble: View {
             }
 
             if !message.attachments.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        ForEach(message.attachments) { att in
-                            AttachmentChipView(
-                                attachment: att,
-                                onTap: { onPreviewAttachment(att.localURL) }
-                            )
-                        }
-                    }
-                }
+                AttachmentBubbleStrip(
+                    attachments: message.attachments,
+                    onPreview: onPreviewAttachment
+                )
             }
 
             Group {
