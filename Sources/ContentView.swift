@@ -448,9 +448,10 @@ enum ZIPArchive {
     }
 }
 
-// MARK: - Mach-O Binary Deep Inspector
+// MARK: - Mach-O Binary Deep Inspector & URL/Strings Scanner
 struct MachOInfo: Sendable {
     let executableName: String
+    let executableURL: URL
     let fileSizeBytes: Int64
     let architectures: [String]
     let isEncrypted: Bool?
@@ -580,7 +581,6 @@ enum MachOInspector {
                     }
                 }
             }
-
             pos += cmdsize
         }
 
@@ -590,6 +590,7 @@ enum MachOInspector {
 
         return MachOInfo(
             executableName: binaryURL.lastPathComponent,
+            executableURL: binaryURL,
             fileSizeBytes: fileSize,
             architectures: archs,
             isEncrypted: cryptID.map { $0 != 0 },
@@ -603,7 +604,69 @@ enum MachOInspector {
     }
 }
 
-// MARK: - Plist & Provision Helpers
+enum BinaryStringsScanner {
+    static func scanURLs(binaryURL: URL, maxResults: Int = 150) -> [String] {
+        guard let handle = try? FileHandle(forReadingFrom: binaryURL) else { return [] }
+        defer { try? handle.close() }
+
+        let ignoredSubstrings = [
+            "apple.com/DTDs", "w3.org/2000", "w3.org/1999", "ns.adobe.com",
+            "schemas.openxmlformats", "purl.org/dc", "xml.org/sax"
+        ]
+        var results: [String] = []
+        var seen: Set<String> = []
+        var buffer: [UInt8] = []
+        buffer.reserveCapacity(256)
+
+        let chunkSize = 512 * 1024
+        let maxBytesToScan = 64 * 1024 * 1024
+        var scanned = 0
+
+        func flushBuffer() {
+            guard buffer.count >= 12 && buffer.count <= 260 else {
+                buffer.removeAll(keepingCapacity: true)
+                return
+            }
+            if let s = String(bytes: buffer, encoding: .ascii),
+               let range = s.range(of: "https://") ?? s.range(of: "http://") {
+                var candidate = String(s[range.lowerBound...])
+                let stopChars = CharacterSet(charactersIn: " \"'<>\\)}\n\r\t")
+                if let stop = candidate.rangeOfCharacter(from: stopChars) {
+                    candidate = String(candidate[..<stop.lowerBound])
+                }
+                if candidate.count >= 12,
+                   candidate.contains("."),
+                   !ignoredSubstrings.contains(where: { candidate.contains($0) }),
+                   !seen.contains(candidate) {
+                    seen.insert(candidate)
+                    results.append(candidate)
+                }
+            }
+            buffer.removeAll(keepingCapacity: true)
+        }
+
+        while scanned < maxBytesToScan && results.count < maxResults {
+            guard let chunk = try? handle.read(upToCount: chunkSize), !chunk.isEmpty else { break }
+            scanned += chunk.count
+            chunk.withUnsafeBytes { raw in
+                guard let ptr = raw.bindMemory(to: UInt8.self).baseAddress else { return }
+                for i in 0..<raw.count {
+                    let b = ptr[i]
+                    if b >= 33 && b <= 126 {
+                        if buffer.count < 260 { buffer.append(b) }
+                    } else if !buffer.isEmpty {
+                        flushBuffer()
+                        if results.count >= maxResults { break }
+                    }
+                }
+            }
+        }
+        flushBuffer()
+        return results
+    }
+}
+
+// MARK: - Plist, Provision & Icon Helpers
 enum PlistHelper {
     static func readDict(url: URL) -> [String: Any]? {
         guard let data = try? Data(contentsOf: url),
@@ -651,7 +714,48 @@ enum PlistHelper {
     }
 }
 
-// MARK: - IPA Workspace Models
+enum AppIconBatchReplacer {
+    static func replaceAllIcons(in appBundleURL: URL, with sourceImageURL: URL) throws -> Int {
+        guard let rawData = try? Data(contentsOf: sourceImageURL),
+              let sourceImage = UIImage(data: rawData) else {
+            throw ZIPArchiveError.ioFailed("Không đọc được file ảnh bạn chọn")
+        }
+
+        let fm = FileManager.default
+        let items = (try? fm.contentsOfDirectory(at: appBundleURL, includingPropertiesForKeys: nil)) ?? []
+        let iconFiles = items.filter {
+            $0.pathExtension.lowercased() == "png" && $0.lastPathComponent.lowercased().contains("icon")
+        }
+
+        var replacedCount = 0
+        for fileURL in iconFiles {
+            var targetPxW: CGFloat = 180
+            var targetPxH: CGFloat = 180
+            if let existing = UIImage(contentsOfFile: fileURL.path) {
+                let w = existing.size.width * existing.scale
+                let h = existing.size.height * existing.scale
+                if w >= 20 && h >= 20 {
+                    targetPxW = w
+                    targetPxH = h
+                }
+            }
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = 1.0
+            format.opaque = true
+            let renderer = UIGraphicsImageRenderer(size: CGSize(width: targetPxW, height: targetPxH), format: format)
+            let resized = renderer.image { _ in
+                sourceImage.draw(in: CGRect(x: 0, y: 0, width: targetPxW, height: targetPxH))
+            }
+            if let png = resized.pngData() {
+                try png.write(to: fileURL, options: .atomic)
+                replacedCount += 1
+            }
+        }
+        return replacedCount
+    }
+}
+
+// MARK: - Workspace Models
 struct IPAFileNode: Identifiable, Hashable, Sendable {
     var id: String { url.path }
     let url: URL
@@ -710,6 +814,7 @@ struct IPAWorkspaceSummary: Sendable {
     let hasPlugIns: Bool
     let hasWatchDir: Bool
     let hasCodeSignature: Bool
+    let urlSchemeCount: Int
     let pluginNames: [String]
     let frameworkNames: [String]
     let totalFilesCount: Int
@@ -719,13 +824,19 @@ struct IPAWorkspaceSummary: Sendable {
     let iconPath: URL?
 }
 
-// MARK: - AI Providers & Streaming SSE Engine
+struct UndoSnapshotEntry {
+    let targetURL: URL
+    let backupURL: URL?
+    let existedBefore: Bool
+}
+
+// MARK: - AI Providers & Streaming SSE Engine (Full AQ. Vertex AI + Multi-API)
 enum AIProvider: String, CaseIterable, Identifiable, Codable, Sendable {
-    case gemini = "Google Gemini"
+    case gemini = "Google Gemini (AQ / Vertex)"
+    case groq = "Groq (Siêu nhanh)"
     case openai = "OpenAI"
     case claude = "Anthropic Claude"
     case deepseek = "DeepSeek"
-    case groq = "Groq"
     case grok = "xAI Grok"
     case openrouter = "OpenRouter"
     case custom = "Custom OpenAI API"
@@ -735,10 +846,10 @@ enum AIProvider: String, CaseIterable, Identifiable, Codable, Sendable {
     var icon: String {
         switch self {
         case .gemini: return "sparkles"
+        case .groq: return "bolt.fill"
         case .openai: return "brain.head.profile"
         case .claude: return "cpu"
         case .deepseek: return "magnifyingglass.circle"
-        case .groq: return "bolt.fill"
         case .grok: return "flame.fill"
         case .openrouter: return "network"
         case .custom: return "server.rack"
@@ -747,11 +858,11 @@ enum AIProvider: String, CaseIterable, Identifiable, Codable, Sendable {
 
     var defaultEndpoint: String {
         switch self {
-        case .gemini: return "https://generativelanguage.googleapis.com/v1beta"
+        case .gemini: return "https://aiplatform.googleapis.com/v1/publishers/google/models"
+        case .groq: return "https://api.groq.com/openai/v1/chat/completions"
         case .openai: return "https://api.openai.com/v1/chat/completions"
         case .claude: return "https://api.anthropic.com/v1/messages"
         case .deepseek: return "https://api.deepseek.com/chat/completions"
-        case .groq: return "https://api.groq.com/openai/v1/chat/completions"
         case .grok: return "https://api.x.ai/v1/chat/completions"
         case .openrouter: return "https://openrouter.ai/api/v1/chat/completions"
         case .custom: return "https://api.openai.com/v1/chat/completions"
@@ -762,14 +873,14 @@ enum AIProvider: String, CaseIterable, Identifiable, Codable, Sendable {
         switch self {
         case .gemini:
             return ["gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-3.8-pro"]
+        case .groq:
+            return ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "llama-3.3-70b-versatile"]
         case .openai:
             return ["gpt-4.1-mini", "gpt-4.1", "gpt-4o", "o4-mini"]
         case .claude:
             return ["claude-sonnet-4-20250514", "claude-3-5-haiku-latest"]
         case .deepseek:
             return ["deepseek-chat", "deepseek-reasoner"]
-        case .groq:
-            return ["llama-3.3-70b-versatile", "qwen-qwq-32b"]
         case .grok:
             return ["grok-3-mini", "grok-3"]
         case .openrouter:
@@ -781,11 +892,11 @@ enum AIProvider: String, CaseIterable, Identifiable, Codable, Sendable {
 
     var keyPlaceholder: String {
         switch self {
-        case .gemini: return "AIzaSy..."
+        case .gemini: return "AQ.Ab8RN... (Vertex / Gemini Key)"
+        case .groq: return "gsk_..."
         case .openai: return "sk-proj-..."
         case .claude: return "sk-ant-..."
         case .deepseek: return "sk-..."
-        case .groq: return "gsk_..."
         case .grok: return "xai-..."
         case .openrouter: return "sk-or-v1-..."
         case .custom: return "Bearer API Key..."
@@ -814,20 +925,13 @@ struct AIPatchAction: Codable, Identifiable, Sendable {
 
     var displayTitle: String {
         switch type {
-        case "set_plist":
-            return "Sửa Info.plist: \(key ?? "?") = \(value ?? "")"
-        case "delete_plist":
-            return "Xóa key Info.plist: \(key ?? "?")"
-        case "patch_plist_file":
-            return "Sửa Plist \(path ?? ""): \(key ?? "?") = \(value ?? "")"
-        case "delete_path":
-            return "Xóa tệp/thư mục: \(path ?? "?")"
-        case "write_text_file":
-            return "Ghi tệp: \(path ?? "?")"
-        case "replace_in_file":
-            return "Thay chuỗi trong \(path ?? "?")"
-        default:
-            return note ?? type
+        case "set_plist": return "Sửa Info.plist: \(key ?? "?") = \(value ?? "")"
+        case "delete_plist": return "Xóa key Info.plist: \(key ?? "?")"
+        case "patch_plist_file": return "Sửa Plist \(path ?? ""): \(key ?? "?") = \(value ?? "")"
+        case "delete_path": return "Xóa tệp/thư mục: \(path ?? "?")"
+        case "write_text_file": return "Ghi tệp: \(path ?? "?")"
+        case "replace_in_file": return "Thay chuỗi trong \(path ?? "?")"
+        default: return note ?? type
         }
     }
 }
@@ -841,7 +945,7 @@ struct AIMessage: Identifiable, Sendable {
     let id = UUID()
     let isUser: Bool
     var text: String
-    let modelBadge: String?
+    var modelBadge: String?
     var patch: AIPatchEnvelope?
     var patchApplied: Bool = false
     var isStreaming: Bool = false
@@ -853,6 +957,21 @@ struct AIChatTurn: Sendable {
 }
 
 enum AIClient {
+    private static func sanitizeAlternatingTurns(_ history: [AIChatTurn]) -> [AIChatTurn] {
+        var cleaned: [AIChatTurn] = []
+        for turn in history {
+            let t = turn.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !t.isEmpty else { continue }
+            if cleaned.isEmpty && !turn.isUser { continue }
+            if let last = cleaned.last, last.isUser == turn.isUser {
+                cleaned[cleaned.count - 1] = AIChatTurn(isUser: last.isUser, text: last.text + "\n\n" + t)
+            } else {
+                cleaned.append(AIChatTurn(isUser: turn.isUser, text: t))
+            }
+        }
+        return cleaned
+    }
+
     static func stream(
         provider: AIProvider,
         model: String,
@@ -864,7 +983,7 @@ enum AIClient {
     ) async throws -> String {
         let cleanKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanKey.isEmpty else {
-            throw NSError(domain: "AIClient", code: 401, userInfo: [NSLocalizedDescriptionKey: "Chưa có API Key cho \(provider.rawValue). Bấm nút Model ở góc trên để dán key."])
+            throw NSError(domain: "AIClient", code: 401, userInfo: [NSLocalizedDescriptionKey: "Chưa nhập API Key cho \(provider.rawValue). Bấm nút Model ở góc trên để dán key."])
         }
 
         switch provider {
@@ -872,7 +991,7 @@ enum AIClient {
             return try await streamGemini(model: model, apiKey: cleanKey, systemPrompt: systemPrompt, history: history, onChunk: onChunk)
         case .claude:
             return try await streamClaude(model: model, apiKey: cleanKey, systemPrompt: systemPrompt, history: history, onChunk: onChunk)
-        case .openai, .deepseek, .groq, .grok, .openrouter, .custom:
+        case .groq, .openai, .deepseek, .grok, .openrouter, .custom:
             let customClean = customEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
             let endpoint = (provider == .custom && !customClean.isEmpty) ? customClean : provider.defaultEndpoint
             return try await streamOpenAI(endpoint: endpoint, model: model, apiKey: cleanKey, systemPrompt: systemPrompt, history: history, onChunk: onChunk)
@@ -886,20 +1005,37 @@ enum AIClient {
         history: [AIChatTurn],
         onChunk: @escaping @Sendable (String) async -> Void
     ) async throws -> String {
-        let encodedModel = model.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? model
-        guard let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(encodedModel):streamGenerateContent?alt=sse&key=\(apiKey)") else {
+        let cleanModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        let encodedModel = cleanModel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? cleanModel
+
+        // Tự động phân luồng: AQ. -> Vertex AI Express v1, AIza -> AI Studio v1beta
+        let useVertex = apiKey.hasPrefix("AQ.") || !apiKey.hasPrefix("AIza")
+        let baseStr = useVertex
+            ? "https://aiplatform.googleapis.com/v1/publishers/google/models/\(encodedModel):streamGenerateContent"
+            : "https://generativelanguage.googleapis.com/v1beta/models/\(encodedModel):streamGenerateContent"
+
+        guard var comps = URLComponents(string: baseStr) else {
             throw NSError(domain: "AIClient", code: 400, userInfo: [NSLocalizedDescriptionKey: "Tên model Gemini không hợp lệ."])
         }
+        comps.queryItems = [
+            URLQueryItem(name: "alt", value: "sse"),
+            URLQueryItem(name: "key", value: apiKey)
+        ]
+        guard let url = comps.url else {
+            throw NSError(domain: "AIClient", code: 400, userInfo: [NSLocalizedDescriptionKey: "Không tạo được URL kết nối Google API."])
+        }
+
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.timeoutInterval = 120
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        let contents: [[String: Any]] = history.map { turn in
+        let safeHistory = sanitizeAlternatingTurns(history)
+        let contents: [[String: Any]] = safeHistory.map { turn in
             ["role": turn.isUser ? "user" : "model", "parts": [["text": turn.text]]]
         }
         let body: [String: Any] = [
-            "system_instruction": ["parts": [["text": systemPrompt]]],
+            "systemInstruction": ["parts": [["text": systemPrompt]]],
             "contents": contents,
             "generationConfig": ["temperature": 0.2]
         ]
@@ -948,7 +1084,8 @@ enum AIClient {
         req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
         req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
 
-        let messages: [[String: Any]] = history.map { ["role": $0.isUser ? "user" : "assistant", "content": $0.text] }
+        let safeHistory = sanitizeAlternatingTurns(history)
+        let messages: [[String: Any]] = safeHistory.map { ["role": $0.isUser ? "user" : "assistant", "content": $0.text] }
         let body: [String: Any] = [
             "model": model,
             "max_tokens": 4096,
@@ -995,7 +1132,7 @@ enum AIClient {
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
 
         var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
-        for turn in history {
+        for turn in sanitizeAlternatingTurns(history) {
             messages.append(["role": turn.isUser ? "user" : "assistant", "content": turn.text])
         }
         let body: [String: Any] = [
@@ -1031,7 +1168,7 @@ enum AIClient {
         var errText = ""
         for try await line in bytes.lines {
             errText += line
-            if errText.count > 360 { break }
+            if errText.count > 420 { break }
         }
         throw NSError(domain: "AIClient", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "Lỗi API (\(http.statusCode)): \(errText)"])
     }
@@ -1057,20 +1194,38 @@ enum AIPatchEngine {
         return (text, nil)
     }
 
+    static func resolveSafeURL(_ relPath: String, appBundleURL: URL, workspaceRoot: URL) -> URL? {
+        let clean = relPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !clean.isEmpty, !clean.contains("..") else { return nil }
+        let candidate = clean.hasPrefix("Payload/")
+            ? workspaceRoot.appendingPathComponent(clean)
+            : appBundleURL.appendingPathComponent(clean)
+        guard candidate.standardizedFileURL.path.hasPrefix(workspaceRoot.standardizedFileURL.path) else { return nil }
+        return candidate
+    }
+
+    static func targetURLs(for actions: [AIPatchAction], appBundleURL: URL, workspaceRoot: URL) -> [URL] {
+        var urls: [URL] = []
+        let infoURL = appBundleURL.appendingPathComponent("Info.plist")
+        for action in actions {
+            switch action.type {
+            case "set_plist", "delete_plist":
+                if !urls.contains(infoURL) { urls.append(infoURL) }
+            case "patch_plist_file", "delete_path", "write_text_file", "replace_in_file":
+                if let p = action.path, let u = resolveSafeURL(p, appBundleURL: appBundleURL, workspaceRoot: workspaceRoot), !urls.contains(u) {
+                    urls.append(u)
+                }
+            default:
+                break
+            }
+        }
+        return urls
+    }
+
     static func apply(actions: [AIPatchAction], appBundleURL: URL, workspaceRoot: URL) -> [String] {
         var logs: [String] = []
         let infoURL = appBundleURL.appendingPathComponent("Info.plist")
         let fm = FileManager.default
-
-        func resolveSafeURL(_ relPath: String) -> URL? {
-            let clean = relPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            guard !clean.isEmpty, !clean.contains("..") else { return nil }
-            let candidate = clean.hasPrefix("Payload/")
-                ? workspaceRoot.appendingPathComponent(clean)
-                : appBundleURL.appendingPathComponent(clean)
-            guard candidate.standardizedFileURL.path.hasPrefix(workspaceRoot.standardizedFileURL.path) else { return nil }
-            return candidate
-        }
 
         func convertValue(_ raw: String, type: String?) -> Any {
             switch (type ?? "string").lowercased() {
@@ -1111,8 +1266,8 @@ enum AIPatchEngine {
                 }
 
             case "patch_plist_file":
-                guard let rel = action.path, let target = resolveSafeURL(rel), let key = action.key,
-                      var dict = PlistHelper.readDict(url: target) else {
+                guard let rel = action.path, let target = resolveSafeURL(rel, appBundleURL: appBundleURL, workspaceRoot: workspaceRoot),
+                      let key = action.key, var dict = PlistHelper.readDict(url: target) else {
                     logs.append("⚠️ Không đọc được Plist: \(action.path ?? "")")
                     continue
                 }
@@ -1129,7 +1284,7 @@ enum AIPatchEngine {
                 }
 
             case "delete_path":
-                guard let rel = action.path, let target = resolveSafeURL(rel) else {
+                guard let rel = action.path, let target = resolveSafeURL(rel, appBundleURL: appBundleURL, workspaceRoot: workspaceRoot) else {
                     logs.append("⚠️ Đường dẫn không hợp lệ: \(action.path ?? "")")
                     continue
                 }
@@ -1145,7 +1300,8 @@ enum AIPatchEngine {
                 }
 
             case "write_text_file":
-                guard let rel = action.path, let target = resolveSafeURL(rel), let content = action.content else {
+                guard let rel = action.path, let target = resolveSafeURL(rel, appBundleURL: appBundleURL, workspaceRoot: workspaceRoot),
+                      let content = action.content else {
                     logs.append("⚠️ Thiếu nội dung cho write_text_file")
                     continue
                 }
@@ -1158,7 +1314,7 @@ enum AIPatchEngine {
                 }
 
             case "replace_in_file":
-                guard let rel = action.path, let target = resolveSafeURL(rel),
+                guard let rel = action.path, let target = resolveSafeURL(rel, appBundleURL: appBundleURL, workspaceRoot: workspaceRoot),
                       let find = action.find, let replace = action.replace,
                       let text = try? String(contentsOf: target, encoding: .utf8) else {
                     logs.append("⚠️ Không đọc được tệp để thay chuỗi: \(action.path ?? "")")
@@ -1191,6 +1347,11 @@ final class IPAStudioManager: ObservableObject {
     @Published var alertMessage: String?
     @Published var changeLog: [String] = []
     @Published var pinnedFilesForAI: [String] = []
+    @Published var scannedBinaryURLs: [String] = []
+    @Published var includeBinaryURLsInAI = false
+    @Published var isScanningBinary = false
+    @Published var canUndo = false
+    @Published var iconRefreshID = UUID()
 
     // AI Config
     @Published var selectedProvider: AIProvider = .gemini {
@@ -1215,11 +1376,12 @@ final class IPAStudioManager: ObservableObject {
     @Published var isAIThinking = false
 
     private var aiStreamTask: Task<Void, Never>?
+    private var lastUndoEntries: [UndoSnapshotEntry] = []
 
-    private let providerKey = "IPAStudio_v4_Provider"
-    private let modelKey = "IPAStudio_v4_Model"
-    private let depthKey = "IPAStudio_v4_Depth"
-    private let keysStorageKey = "IPAStudio_APIKeys"
+    private let providerKey = "IPAStudio_v45_Provider"
+    private let modelKey = "IPAStudio_v45_Model"
+    private let depthKey = "IPAStudio_v45_Depth"
+    private let keysStorageKey = "IPAStudio_v45_APIKeys"
     private let customEndpointKey = "IPAStudio_CustomEndpoint"
     private let compressKey = "IPAStudio_Compress"
 
@@ -1229,6 +1391,10 @@ final class IPAStudioManager: ObservableObject {
 
     var workspaceDir: URL {
         documentsDir.appendingPathComponent("ActiveIPAWorkspace", isDirectory: true)
+    }
+
+    var undoBackupDir: URL {
+        documentsDir.appendingPathComponent("UndoBackup", isDirectory: true)
     }
 
     var exportsDir: URL {
@@ -1255,6 +1421,14 @@ final class IPAStudioManager: ObservableObject {
         }
         if let savedKeys = UserDefaults.standard.dictionary(forKey: keysStorageKey) as? [String: String] {
             apiKeys = savedKeys
+        } else if let legacyKeys = UserDefaults.standard.dictionary(forKey: "IPAStudio_APIKeys") as? [String: String] {
+            var migrated: [String: String] = [:]
+            for (k, v) in legacyKeys {
+                if k == "Google Gemini" { migrated[AIProvider.gemini.rawValue] = v }
+                else if k == "Groq" { migrated[AIProvider.groq.rawValue] = v }
+                else { migrated[k] = v }
+            }
+            apiKeys = migrated
         }
         customEndpoint = UserDefaults.standard.string(forKey: customEndpointKey) ?? ""
         if UserDefaults.standard.object(forKey: compressKey) != nil {
@@ -1263,7 +1437,7 @@ final class IPAStudioManager: ObservableObject {
         messages = [
             AIMessage(
                 isUser: false,
-                text: "Nhập file `.ipa` ở tab **IPA**, chọn model AI ở góc trên rồi ra lệnh soi sâu hoặc tự động chỉnh sửa gói IPA.",
+                text: "TueeHub IPA Studio v4.5 đã sẵn sàng hỗ trợ key `AQ.` (Vertex AI) và Groq. Nhập file `.ipa` ở tab **IPA**, rồi quay lại đây ra lệnh soi sâu hoặc tự động chỉnh sửa.",
                 modelBadge: nil,
                 patch: nil
             )
@@ -1279,6 +1453,47 @@ final class IPAStudioManager: ObservableObject {
         if !provider.presetModels.contains(selectedModel) {
             selectedModel = provider.presetModels.first ?? ""
         }
+    }
+
+    // MARK: - Undo Snapshot System
+    private func recordUndoSnapshot(for targets: [URL]) {
+        let fm = FileManager.default
+        try? fm.removeItem(at: undoBackupDir)
+        try? fm.createDirectory(at: undoBackupDir, withIntermediateDirectories: true)
+
+        var entries: [UndoSnapshotEntry] = []
+        for (i, target) in targets.enumerated() {
+            if fm.fileExists(atPath: target.path) {
+                let backup = undoBackupDir.appendingPathComponent("bak_\(i)_\(target.lastPathComponent)")
+                if (try? fm.copyItem(at: target, to: backup)) != nil {
+                    entries.append(UndoSnapshotEntry(targetURL: target, backupURL: backup, existedBefore: true))
+                }
+            } else {
+                entries.append(UndoSnapshotEntry(targetURL: target, backupURL: nil, existedBefore: false))
+            }
+        }
+        lastUndoEntries = entries
+        canUndo = !entries.isEmpty
+    }
+
+    func performUndo() {
+        guard !lastUndoEntries.isEmpty else { return }
+        let fm = FileManager.default
+        for entry in lastUndoEntries.reversed() {
+            if fm.fileExists(atPath: entry.targetURL.path) {
+                try? fm.removeItem(at: entry.targetURL)
+            }
+            if entry.existedBefore, let backup = entry.backupURL, fm.fileExists(atPath: backup.path) {
+                try? fm.createDirectory(at: entry.targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try? fm.copyItem(at: backup, to: entry.targetURL)
+            }
+        }
+        lastUndoEntries = []
+        canUndo = false
+        changeLog.insert("↩️ Đã hoàn tác thay đổi gần nhất", at: 0)
+        iconRefreshID = UUID()
+        refreshWorkspace()
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
     }
 
     // MARK: - Import & Analyze IPA
@@ -1318,6 +1533,11 @@ final class IPAStudioManager: ObservableObject {
 
                 self.summary = analyzed
                 self.pinnedFilesForAI = []
+                self.scannedBinaryURLs = []
+                self.includeBinaryURLsInAI = false
+                self.lastUndoEntries = []
+                self.canUndo = false
+                self.iconRefreshID = UUID()
                 self.changeLog = ["Đã mở gói: \(sourceName)"]
                 self.isBusy = false
                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()
@@ -1340,6 +1560,19 @@ final class IPAStudioManager: ObservableObject {
             }).value {
                 self.summary = analyzed
             }
+        }
+    }
+
+    func scanBinaryStrings() {
+        guard let execURL = summary?.machO?.executableURL, !isScanningBinary else { return }
+        isScanningBinary = true
+        Task {
+            let urls = await Task.detached(priority: .userInitiated) {
+                BinaryStringsScanner.scanURLs(binaryURL: execURL, maxResults: 150)
+            }.value
+            self.scannedBinaryURLs = urls
+            self.isScanningBinary = false
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
         }
     }
 
@@ -1378,6 +1611,8 @@ final class IPAStudioManager: ObservableObject {
         let execName = (plist["CFBundleExecutable"] as? String) ?? appBundle.deletingPathExtension().lastPathComponent
         let fileSharing = (plist["UIFileSharingEnabled"] as? Bool) ?? false
         let hasDeviceLimit = plist["UISupportedDevices"] != nil
+        let urlTypes = (plist["CFBundleURLTypes"] as? [[String: Any]]) ?? []
+        let schemeCount = urlTypes.reduce(0) { $0 + ((($1["CFBundleURLSchemes"] as? [String])?.count) ?? 0) }
 
         let plugInsDir = appBundle.appendingPathComponent("PlugIns")
         let plugins = (try? fm.contentsOfDirectory(atPath: plugInsDir.path)) ?? []
@@ -1422,6 +1657,7 @@ final class IPAStudioManager: ObservableObject {
             hasPlugIns: !plugins.isEmpty,
             hasWatchDir: hasWatch,
             hasCodeSignature: hasCodeSig,
+            urlSchemeCount: schemeCount,
             pluginNames: plugins,
             frameworkNames: frameworks,
             totalFilesCount: fileCount,
@@ -1432,9 +1668,11 @@ final class IPAStudioManager: ObservableObject {
         )
     }
 
-    // MARK: - Quick Edits & Cleanup
+    // MARK: - Quick Edits, Icon Replacer, Clone & Bypass Tools
     func applyManualEdits(name: String, bundleID: String, version: String, minOS: String, fileSharing: Bool, removeDeviceLimit: Bool) {
         guard let sum = summary, var dict = PlistHelper.readDict(url: sum.infoPlistURL) else { return }
+        recordUndoSnapshot(for: [sum.infoPlistURL])
+
         dict["CFBundleDisplayName"] = name
         dict["CFBundleName"] = name
         dict["CFBundleIdentifier"] = bundleID
@@ -1458,6 +1696,7 @@ final class IPAStudioManager: ObservableObject {
         guard let sum = summary else { return }
         let target = sum.appBundleURL.appendingPathComponent(folderName)
         if FileManager.default.fileExists(atPath: target.path) {
+            recordUndoSnapshot(for: [target])
             do {
                 try FileManager.default.removeItem(at: target)
                 changeLog.insert("✓ Đã xóa \(folderName)", at: 0)
@@ -1472,6 +1711,9 @@ final class IPAStudioManager: ObservableObject {
     func cleanAllForSideload() {
         guard let sum = summary else { return }
         let fm = FileManager.default
+        let targets = ["PlugIns", "Watch", "_CodeSignature"].map { sum.appBundleURL.appendingPathComponent($0) } + [sum.infoPlistURL]
+        recordUndoSnapshot(for: targets)
+
         var removed: [String] = []
         for dir in ["PlugIns", "Watch", "_CodeSignature"] {
             let target = sum.appBundleURL.appendingPathComponent(dir)
@@ -1490,6 +1732,70 @@ final class IPAStudioManager: ObservableObject {
         changeLog.insert("✓ \(note)", at: 0)
         refreshWorkspace()
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+    }
+
+    func applyCloneSchemeFix() {
+        guard let sum = summary, var dict = PlistHelper.readDict(url: sum.infoPlistURL) else { return }
+        recordUndoSnapshot(for: [sum.infoPlistURL])
+
+        let currentBID = (dict["CFBundleIdentifier"] as? String) ?? sum.bundleID
+        if !currentBID.hasSuffix(".clone") {
+            dict["CFBundleIdentifier"] = currentBID + ".clone"
+        }
+        let currentName = (dict["CFBundleDisplayName"] as? String) ?? sum.displayName
+        if !currentName.contains("Clone") {
+            dict["CFBundleDisplayName"] = currentName + " Clone"
+            dict["CFBundleName"] = currentName + " Clone"
+        }
+        if var urlTypes = dict["CFBundleURLTypes"] as? [[String: Any]] {
+            for i in urlTypes.indices {
+                if let schemes = urlTypes[i]["CFBundleURLSchemes"] as? [String] {
+                    urlTypes[i]["CFBundleURLSchemes"] = schemes.map { $0.hasSuffix("-clone") ? $0 : "\($0)-clone" }
+                }
+            }
+            dict["CFBundleURLTypes"] = urlTypes
+        }
+
+        do {
+            try PlistHelper.writeDict(dict, to: sum.infoPlistURL)
+            changeLog.insert("✓ Đã nhân bản Bundle ID & URL Schemes", at: 0)
+            refreshWorkspace()
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        } catch {
+            alertMessage = "Lỗi sửa Clone: \(error.localizedDescription)"
+        }
+    }
+
+    func applyBypassForceUpdate() {
+        guard let sum = summary, var dict = PlistHelper.readDict(url: sum.infoPlistURL) else { return }
+        recordUndoSnapshot(for: [sum.infoPlistURL])
+        dict["CFBundleShortVersionString"] = "99.9.9"
+        dict["CFBundleVersion"] = "99999"
+        do {
+            try PlistHelper.writeDict(dict, to: sum.infoPlistURL)
+            changeLog.insert("✓ Đã giả lập phiên bản 99.9.9 (99999)", at: 0)
+            refreshWorkspace()
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        } catch {
+            alertMessage = "Lỗi sửa phiên bản: \(error.localizedDescription)"
+        }
+    }
+
+    func replaceAppIconsBatch(with imageURL: URL) {
+        guard let sum = summary else { return }
+        do {
+            let count = try AppIconBatchReplacer.replaceAllIcons(in: sum.appBundleURL, with: imageURL)
+            iconRefreshID = UUID()
+            if count > 0 {
+                changeLog.insert("✓ Đã thay \(count) file AppIcon", at: 0)
+                refreshWorkspace()
+                alertMessage = "Đã tự động thu phóng và thay \(count) ảnh AppIcon trong gói IPA."
+            } else {
+                alertMessage = "Không tìm thấy file AppIcon*.png trực tiếp trong .app (app có thể lưu icon trong Assets.car)."
+            }
+        } catch {
+            alertMessage = error.localizedDescription
+        }
     }
 
     func exportEditedIPA() {
@@ -1571,10 +1877,12 @@ final class IPAStudioManager: ObservableObject {
     }
 
     func replaceFile(at targetURL: URL, with sourceURL: URL, relativePath: String) {
+        recordUndoSnapshot(for: [targetURL])
         do {
             let data = try Data(contentsOf: sourceURL)
             try data.write(to: targetURL, options: .atomic)
             changeLog.insert("✓ Đã thay tệp: \(relativePath)", at: 0)
+            iconRefreshID = UUID()
             refreshWorkspace()
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         } catch {
@@ -1590,7 +1898,7 @@ final class IPAStudioManager: ObservableObject {
         }
     }
 
-    // MARK: - Smart Compact / Deep AI Context
+    // MARK: - AI Context Builder & Auto-Retry Streaming
     private func buildIPAContext() -> String {
         guard let sum = summary else {
             return "Hiện người dùng CHƯA nhập file IPA nào."
@@ -1599,7 +1907,7 @@ final class IPAStudioManager: ObservableObject {
         lines.append("=== IPA ĐANG MỞ ===")
         lines.append("File: \(sum.sourceFileName) (\(ByteCountFormatter.string(fromByteCount: sum.originalIPASize, countStyle: .file)))")
         lines.append("Name: \(sum.displayName) | BundleID: \(sum.bundleID) | Ver: \(sum.version) (\(sum.buildNumber)) | MinOS: \(sum.minOS)")
-        lines.append("Exec: \(sum.executableName) | Files: \(sum.totalFilesCount) | FileSharing: \(sum.fileSharingEnabled) | DeviceLimit: \(sum.hasSupportedDevicesLimit) | CodeSig: \(sum.hasCodeSignature)")
+        lines.append("Exec: \(sum.executableName) | Files: \(sum.totalFilesCount) | FileSharing: \(sum.fileSharingEnabled) | DeviceLimit: \(sum.hasSupportedDevicesLimit) | CodeSig: \(sum.hasCodeSignature) | URLSchemes: \(sum.urlSchemeCount)")
         if !sum.pluginNames.isEmpty { lines.append("PlugIns: \(sum.pluginNames.joined(separator: ", "))") }
         if !sum.frameworkNames.isEmpty { lines.append("Frameworks (\(sum.frameworkNames.count)): \(sum.frameworkNames.prefix(30).joined(separator: ", "))") }
         if let prov = sum.provisionSummary { lines.append("Provision: \(prov)") }
@@ -1607,6 +1915,11 @@ final class IPAStudioManager: ObservableObject {
         if let m = sum.machO {
             let enc = m.isEncrypted == nil ? "None" : (m.isEncrypted == true ? "ENCRYPTED(cryptid=\(m.cryptID ?? 1))" : "Decrypted(0)")
             lines.append("Mach-O: arch=\(m.architectures.joined(separator: ",")) | FairPlay=\(enc) | SDK=\(m.sdkVersion ?? "N/A") | InjectedDylibs=\(m.injectedDylibs.joined(separator: ", "))")
+        }
+
+        if includeBinaryURLsInAI && !scannedBinaryURLs.isEmpty {
+            lines.append("\n=== URL TRÍCH TỪ MACH-O BINARY (\(scannedBinaryURLs.count)) ===")
+            lines.append(scannedBinaryURLs.prefix(60).joined(separator: "\n"))
         }
 
         if contextDepth == .deep {
@@ -1638,7 +1951,7 @@ final class IPAStudioManager: ObservableObject {
 
     private func buildSystemPrompt() -> String {
         """
-        Bạn là chuyên gia iOS Reverse Engineering & IPA Modding trong app TueeHub IPA Studio. Trả lời tiếng Việt ngắn gọn, đúng trọng tâm.
+        Bạn là chuyên gia iOS Reverse Engineering & IPA Modding trong TueeHub IPA Studio v4.5. Trả lời tiếng Việt ngắn gọn, kỹ thuật chuẩn xác.
 
         Dữ liệu IPA hiện tại:
         \(buildIPAContext())
@@ -1672,16 +1985,16 @@ final class IPAStudioManager: ObservableObject {
         messages.append(AIMessage(isUser: true, text: trimmed, modelBadge: nil, patch: nil))
 
         let provider = selectedProvider
-        let model = selectedModel
+        let primaryModel = selectedModel
         let key = currentAPIKey
         let endpoint = customEndpoint
         let sysPrompt = buildSystemPrompt()
-        let history = messages.suffix(6).map { AIChatTurn(isUser: $0.isUser, text: $0.text) }
+        let history = messages.suffix(8).map { AIChatTurn(isUser: $0.isUser, text: $0.text) }
 
         let placeholder = AIMessage(
             isUser: false,
             text: "",
-            modelBadge: "\(provider.rawValue) • \(model)",
+            modelBadge: "\(provider.rawValue) • \(primaryModel)",
             patch: nil,
             isStreaming: true
         )
@@ -1690,44 +2003,66 @@ final class IPAStudioManager: ObservableObject {
         isAIThinking = true
 
         aiStreamTask = Task {
-            do {
-                let fullReply = try await AIClient.stream(
-                    provider: provider,
-                    model: model,
-                    apiKey: key,
-                    customEndpoint: endpoint,
-                    systemPrompt: sysPrompt,
-                    history: history
-                ) { chunk in
+            var activeModel = primaryModel
+            var attempt = 0
+            while attempt < 2 {
+                attempt += 1
+                do {
+                    let fullReply = try await AIClient.stream(
+                        provider: provider,
+                        model: activeModel,
+                        apiKey: key,
+                        customEndpoint: endpoint,
+                        systemPrompt: sysPrompt,
+                        history: history
+                    ) { chunk in
+                        await MainActor.run {
+                            if let idx = self.messages.firstIndex(where: { $0.id == replyID }) {
+                                self.messages[idx].text += chunk
+                            }
+                        }
+                    }
+
                     await MainActor.run {
                         if let idx = self.messages.firstIndex(where: { $0.id == replyID }) {
-                            self.messages[idx].text += chunk
+                            self.messages[idx].isStreaming = false
+                            let finalRaw = fullReply.isEmpty ? self.messages[idx].text : fullReply
+                            let parsed = AIPatchEngine.extractPatch(from: finalRaw)
+                            self.messages[idx].text = parsed.cleanText.isEmpty ? (parsed.patch?.summary ?? "Đã hoàn tất.") : parsed.cleanText
+                            self.messages[idx].patch = parsed.patch
                         }
+                        self.isAIThinking = false
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     }
-                }
+                    return
+                } catch {
+                    let nsErr = error as NSError
+                    let isOverloaded = (nsErr.code == 503 || nsErr.code == 429)
+                    if provider == .gemini && isOverloaded && attempt == 1 && !Task.isCancelled {
+                        let fallbackModel = (activeModel == "gemini-3.8-flash-lite") ? "gemini-3.8-flash-lite" : "gemini-3.8-flash-lite"
+                        activeModel = fallbackModel
+                        await MainActor.run {
+                            if let idx = self.messages.firstIndex(where: { $0.id == replyID }) {
+                                self.messages[idx].text = ""
+                                self.messages[idx].modelBadge = "Auto-Fallback 503 → \(fallbackModel)"
+                            }
+                        }
+                        try? await Task.sleep(nanoseconds: 900_000_000)
+                        continue
+                    }
 
-                await MainActor.run {
-                    if let idx = self.messages.firstIndex(where: { $0.id == replyID }) {
-                        self.messages[idx].isStreaming = false
-                        let finalRaw = fullReply.isEmpty ? self.messages[idx].text : fullReply
-                        let parsed = AIPatchEngine.extractPatch(from: finalRaw)
-                        self.messages[idx].text = parsed.cleanText.isEmpty ? (parsed.patch?.summary ?? "Đã hoàn tất.") : parsed.cleanText
-                        self.messages[idx].patch = parsed.patch
-                    }
-                    self.isAIThinking = false
-                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                }
-            } catch {
-                await MainActor.run {
-                    if let idx = self.messages.firstIndex(where: { $0.id == replyID }) {
-                        self.messages[idx].isStreaming = false
-                        if !Task.isCancelled {
-                            self.messages[idx].text = "❌ \(error.localizedDescription)"
-                        } else if self.messages[idx].text.isEmpty {
-                            self.messages[idx].text = "Đã dừng."
+                    await MainActor.run {
+                        if let idx = self.messages.firstIndex(where: { $0.id == replyID }) {
+                            self.messages[idx].isStreaming = false
+                            if !Task.isCancelled {
+                                self.messages[idx].text = "❌ \(error.localizedDescription)"
+                            } else if self.messages[idx].text.isEmpty {
+                                self.messages[idx].text = "Đã dừng."
+                            }
                         }
+                        self.isAIThinking = false
                     }
-                    self.isAIThinking = false
+                    return
                 }
             }
         }
@@ -1747,6 +2082,9 @@ final class IPAStudioManager: ObservableObject {
               let idx = messages.firstIndex(where: { $0.id == messageID }),
               let patch = messages[idx].patch else { return }
 
+        let targets = AIPatchEngine.targetURLs(for: patch.actions, appBundleURL: sum.appBundleURL, workspaceRoot: sum.workspaceRoot)
+        recordUndoSnapshot(for: targets)
+
         let logs = AIPatchEngine.apply(actions: patch.actions, appBundleURL: sum.appBundleURL, workspaceRoot: sum.workspaceRoot)
         messages[idx].patchApplied = true
         for l in logs.reversed() { changeLog.insert(l, at: 0) }
@@ -1757,13 +2095,18 @@ final class IPAStudioManager: ObservableObject {
 
     func clearWorkspace() {
         try? FileManager.default.removeItem(at: workspaceDir)
+        try? FileManager.default.removeItem(at: undoBackupDir)
         summary = nil
         pinnedFilesForAI = []
+        scannedBinaryURLs = []
+        includeBinaryURLsInAI = false
+        lastUndoEntries = []
+        canUndo = false
         changeLog = []
     }
 }
 
-// MARK: - Root ContentView (100% Native iOS TabView)
+// MARK: - Root ContentView
 struct ContentView: View {
     @StateObject private var store = IPAStudioManager()
 
@@ -1824,7 +2167,7 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Tab 1: IPA Overview & Deep Inspector
+// MARK: - Tab 1: IPA Overview, Mach-O Inspector & Quick Tools
 struct IPAOverviewTab: View {
     @ObservedObject var store: IPAStudioManager
 
@@ -1840,7 +2183,7 @@ struct IPAOverviewTab: View {
             Group {
                 if let sum = store.summary {
                     List {
-                        // Hero Card gọn gàng chuẩn Apple
+                        // Hero Card
                         Section {
                             VStack(spacing: 14) {
                                 HStack(spacing: 14) {
@@ -1850,6 +2193,7 @@ struct IPAOverviewTab: View {
                                             .scaledToFill()
                                             .frame(width: 64, height: 64)
                                             .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
+                                            .id(store.iconRefreshID)
                                     } else {
                                         Image(systemName: "app.dashed")
                                             .font(.system(size: 30))
@@ -1890,7 +2234,6 @@ struct IPAOverviewTab: View {
                                     Spacer()
                                 }
 
-                                // 3 ô thông số nhanh
                                 HStack(spacing: 8) {
                                     QuickStatTile(title: "Tệp", value: "\(sum.totalFilesCount)")
                                     QuickStatTile(title: "Kiến trúc", value: sum.machO?.architectures.first ?? "N/A")
@@ -1910,7 +2253,7 @@ struct IPAOverviewTab: View {
                             .padding(.vertical, 4)
                         }
 
-                        // Mach-O Binary Inspector
+                        // Mach-O & Binary Scanner
                         if let m = sum.machO {
                             Section("Soi Mach-O Binary (\(m.executableName))") {
                                 LabeledContent("Dung lượng Binary", value: ByteCountFormatter.string(fromByteCount: m.fileSizeBytes, countStyle: .file))
@@ -1922,6 +2265,11 @@ struct IPAOverviewTab: View {
                                     DylibListView(machO: m)
                                 } label: {
                                     LabeledContent("Thư viện Dylib", value: "\(m.injectedDylibs.count) nhúng • \(m.linkedDylibs.count) tổng")
+                                }
+                                NavigationLink {
+                                    BinaryURLScannerView(store: store)
+                                } label: {
+                                    LabeledContent("Quét URL ẩn trong Binary", value: store.scannedBinaryURLs.isEmpty ? "Chưa quét" : "\(store.scannedBinaryURLs.count) link")
                                 }
                             }
                         }
@@ -1952,12 +2300,32 @@ struct IPAOverviewTab: View {
                             }
                         }
 
-                        // Dọn gói Sideload
-                        Section("Dọn gói & Tối ưu Sideload") {
+                        // Công cụ v4.5: 1 chạm
+                        Section("Công cụ Mod 1 chạm (v4.5)") {
                             Button {
                                 store.cleanAllForSideload()
                             } label: {
-                                Label("Tối ưu toàn bộ 1 chạm (Xóa rác + Bật FileSharing)", systemImage: "wand.and.stars")
+                                Label("Tối ưu Sideload (Xóa rác + Bật FileSharing)", systemImage: "wand.and.stars")
+                            }
+
+                            Button {
+                                NativeFilePicker.shared.pick(types: [.image, .png, .jpeg]) { urls in
+                                    if let first = urls.first { store.replaceAppIconsBatch(with: first) }
+                                }
+                            } label: {
+                                Label("Thay toàn bộ App Icon bằng 1 ảnh", systemImage: "app.badge.checkmark")
+                            }
+
+                            Button {
+                                store.applyCloneSchemeFix()
+                            } label: {
+                                Label("Nhân bản App + Fix URL Schemes (\(sum.urlSchemeCount))", systemImage: "doc.on.doc")
+                            }
+
+                            Button {
+                                store.applyBypassForceUpdate()
+                            } label: {
+                                Label("Giả lập Version 99.9.9 (Chặn ép cập nhật)", systemImage: "arrow.up.forward.circle")
                             }
 
                             if sum.hasPlugIns {
@@ -1994,6 +2362,7 @@ struct IPAOverviewTab: View {
                     .onAppear { syncForm(sum) }
                     .onChange(of: sum.bundleID) { _ in syncForm(sum) }
                     .onChange(of: sum.displayName) { _ in syncForm(sum) }
+                    .onChange(of: sum.version) { _ in syncForm(sum) }
                 } else {
                     EmptyWorkspaceView(
                         icon: "shippingbox.and.arrow.backward",
@@ -2009,7 +2378,14 @@ struct IPAOverviewTab: View {
             }
             .navigationTitle("IPA Studio")
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    if store.canUndo {
+                        Button {
+                            store.performUndo()
+                        } label: {
+                            Image(systemName: "arrow.uturn.backward")
+                        }
+                    }
                     Button {
                         NativeFilePicker.shared.pick { urls in
                             if let first = urls.first { store.importIPA(from: first) }
@@ -2038,6 +2414,61 @@ struct IPAOverviewTab: View {
         editMinOS = sum.minOS
         editFileSharing = sum.fileSharingEnabled
         removeDeviceLimit = false
+    }
+}
+
+struct BinaryURLScannerView: View {
+    @ObservedObject var store: IPAStudioManager
+    @State private var searchText = ""
+
+    var filtered: [String] {
+        guard !searchText.isEmpty else { return store.scannedBinaryURLs }
+        return store.scannedBinaryURLs.filter { $0.localizedCaseInsensitiveContains(searchText) }
+    }
+
+    var body: some View {
+        List {
+            Section {
+                Button {
+                    store.scanBinaryStrings()
+                } label: {
+                    HStack {
+                        Label(store.isScanningBinary ? "Đang quét file Binary..." : "Quét toàn bộ URL trong Mach-O", systemImage: "magnifyingglass.circle.fill")
+                        Spacer()
+                        if store.isScanningBinary { ProgressView() }
+                    }
+                }
+                .disabled(store.isScanningBinary)
+
+                if !store.scannedBinaryURLs.isEmpty {
+                    Toggle("Gửi danh sách URL này cho AI soi", isOn: $store.includeBinaryURLsInAI)
+                }
+            }
+
+            if !filtered.isEmpty {
+                Section("Phát hiện \(filtered.count) đường dẫn") {
+                    ForEach(filtered, id: \.self) { url in
+                        Text(url)
+                            .font(.caption.monospaced())
+                            .textSelection(.enabled)
+                            .contextMenu {
+                                Button {
+                                    UIPasteboard.general.string = url
+                                } label: {
+                                    Label("Copy URL", systemImage: "doc.on.doc")
+                                }
+                            }
+                    }
+                }
+            }
+        }
+        .navigationTitle("URL trong Binary")
+        .searchable(text: $searchText, prompt: "Lọc domain (ads, api, firebase)...")
+        .onAppear {
+            if store.scannedBinaryURLs.isEmpty {
+                store.scanBinaryStrings()
+            }
+        }
     }
 }
 
@@ -2149,7 +2580,7 @@ struct DylibListView: View {
     }
 }
 
-// MARK: - Tab 2: AI Studio (Streaming SSE + Fast/Deep Toggle)
+// MARK: - Tab 2: AI Studio (Streaming SSE + Auto 503 Fallback)
 struct AIStudioTab: View {
     @ObservedObject var store: IPAStudioManager
     @State private var inputText = ""
@@ -2158,14 +2589,13 @@ struct AIStudioTab: View {
     private let quickPrompts: [(title: String, prompt: String)] = [
         ("Soi toàn diện", "Soi nhanh toàn bộ file IPA: mã hóa FairPlay, dylib/tweak nhúng, PlugIns thừa và đề xuất chỉnh sửa."),
         ("Tối ưu Sideload", "Chỉnh gói IPA tối ưu để cài sideload: bật UIFileSharingEnabled, gỡ UISupportedDevices, xóa PlugIns, Watch và _CodeSignature."),
-        ("Tìm Ads / Tracking", "Kiểm tra Frameworks và cấu trúc gói xem có SDK quảng cáo hoặc tracking nào không và cách xử lý."),
-        ("Đổi Bundle ID", "Tạo bản sửa đổi Bundle ID thành bản nhân bản (thêm đuôi .clone) và đổi tên hiển thị kèm hậu tố Clone.")
+        ("Soi Ads / Server", "Kiểm tra Frameworks và danh sách URL trích từ Binary xem có SDK quảng cáo hoặc tracking nào không."),
+        ("Đổi Bundle ID", "Tạo gói sửa đổi Bundle ID thành bản nhân bản (thêm đuôi .clone) và đổi tên hiển thị kèm hậu tố Clone.")
     ]
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                // Thanh Model + Chế độ Nhanh/Sâu
                 HStack(spacing: 8) {
                     Button {
                         showModelPicker = true
@@ -2201,16 +2631,24 @@ struct AIStudioTab: View {
                 .padding(.horizontal, 14)
                 .padding(.vertical, 8)
 
-                // Lệnh nhanh 1 chạm
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         if !store.pinnedFilesForAI.isEmpty {
-                            Text("✨ \(store.pinnedFilesForAI.count) tệp ghim")
+                            Text("✨ \(store.pinnedFilesForAI.count) tệp")
                                 .font(.caption.bold())
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 6)
                                 .background(Color.purple.opacity(0.2))
                                 .foregroundStyle(.purple)
+                                .clipShape(Capsule())
+                        }
+                        if store.includeBinaryURLsInAI && !store.scannedBinaryURLs.isEmpty {
+                            Text("🔗 \(store.scannedBinaryURLs.count) URL")
+                                .font(.caption.bold())
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(Color.blue.opacity(0.2))
+                                .foregroundStyle(.blue)
                                 .clipShape(Capsule())
                         }
                         ForEach(quickPrompts, id: \.title) { item in
@@ -2234,7 +2672,6 @@ struct AIStudioTab: View {
 
                 Divider()
 
-                // Khung hội thoại Streaming
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 14) {
@@ -2260,7 +2697,6 @@ struct AIStudioTab: View {
 
                 Divider()
 
-                // Ô nhập lệnh + nút Gửi / Dừng
                 HStack(spacing: 10) {
                     TextField("Yêu cầu AI soi hoặc sửa IPA...", text: $inputText, axis: .vertical)
                         .lineLimit(1...4)
@@ -2296,7 +2732,14 @@ struct AIStudioTab: View {
             .navigationTitle("AI Studio")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    if store.canUndo {
+                        Button {
+                            store.performUndo()
+                        } label: {
+                            Image(systemName: "arrow.uturn.backward")
+                        }
+                    }
                     Button {
                         showModelPicker = true
                     } label: {
@@ -2476,6 +2919,15 @@ struct AIModelSelectorSheet: View {
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
 
+                    if store.selectedProvider == .gemini {
+                        let key = store.apiKeys[AIProvider.gemini.rawValue] ?? ""
+                        if !key.isEmpty {
+                            Text(key.hasPrefix("AQ.") ? "✓ Đang dùng cổng Vertex AI Express (AQ.)" : "✓ Đang dùng cổng Google AI Studio")
+                                .font(.caption2.bold())
+                                .foregroundStyle(.green)
+                        }
+                    }
+
                     if store.selectedProvider == .custom {
                         TextField("https://.../v1/chat/completions", text: $store.customEndpoint)
                             .font(.caption.monospaced())
@@ -2627,7 +3079,7 @@ struct FileDetailEditorView: View {
                                 .frame(maxHeight: 320)
                                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                                 .padding(.top, 20)
-                            Text("\(Int(img.size.width)) × \(Int(img.size.height)) px • \(node.formattedSize)")
+                            Text("\(Int(img.size.width * img.scale)) × \(Int(img.size.height * img.scale)) px • \(node.formattedSize)")
                                 .font(.caption.monospaced())
                                 .foregroundStyle(.secondary)
                         }
@@ -2746,7 +3198,7 @@ struct APISettingsTab: View {
                     }
                 }
 
-                Section("Kho API Key (Tất cả hệ AI)") {
+                Section("Kho API Key") {
                     ForEach(AIProvider.allCases) { provider in
                         VStack(alignment: .leading, spacing: 6) {
                             HStack {
